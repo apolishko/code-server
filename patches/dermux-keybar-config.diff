@@ -1,0 +1,611 @@
+Extend Dermux keybar with HJSON config, gestures and runtime reload.
+
+This patch introduces:
+1. `hjson` dependency for strict config parsing.
+2. Config model validation and rendering from two-row layout.
+3. Tap/up/down gesture routing with swipe thresholds.
+4. Runtime config reload command and workspace file watch (`.dermux-keybar.hjson`).
+5. Action dispatch (`command|key|text|noop`).
+
+Index: code-server/lib/vscode/package-lock.json
+===================================================================
+--- code-server.orig/lib/vscode/package-lock.json
++++ code-server/lib/vscode/package-lock.json
+@@ -40,6 +40,7 @@
+         "@xterm/addon-webgl": "^0.20.0-beta.108",
+         "@xterm/headless": "^6.1.0-beta.109",
+         "@xterm/xterm": "^6.1.0-beta.109",
++        "hjson": "^3.2.2",
+         "http-proxy-agent": "^7.0.0",
+         "https-proxy-agent": "^7.0.2",
+         "jschardet": "3.1.4",
+@@ -10151,6 +10152,15 @@
+         "he": "bin/he"
+       }
+     },
++    "node_modules/hjson": {
++      "version": "3.2.2",
++      "resolved": "https://registry.npmjs.org/hjson/-/hjson-3.2.2.tgz",
++      "integrity": "sha512-MkUeB0cTIlppeSsndgESkfFD21T2nXPRaBStLtf3cAYA2bVEFdXlodZB0TukwZiobPD1Ksax5DK4RTZeaXCI3Q==",
++      "license": "MIT",
++      "bin": {
++        "hjson": "bin/hjson"
++      }
++    },
+     "node_modules/homedir-polyfill": {
+       "version": "1.0.3",
+       "resolved": "https://registry.npmjs.org/homedir-polyfill/-/homedir-polyfill-1.0.3.tgz",
+Index: code-server/lib/vscode/package.json
+===================================================================
+--- code-server.orig/lib/vscode/package.json
++++ code-server/lib/vscode/package.json
+@@ -102,6 +102,7 @@
+     "@xterm/addon-webgl": "^0.20.0-beta.108",
+     "@xterm/headless": "^6.1.0-beta.109",
+     "@xterm/xterm": "^6.1.0-beta.109",
++    "hjson": "^3.2.2",
+     "http-proxy-agent": "^7.0.0",
+     "https-proxy-agent": "^7.0.2",
+     "jschardet": "3.1.4",
+Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
++++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
+@@ -1,28 +1,92 @@
+-import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
++import { Disposable, DisposableStore, toDisposable } from "../../base/common/lifecycle.js";
+ import { isMobile } from '../../base/common/platform.js';
++import { joinPath } from '../../base/common/resources.js';
+ import { localize } from '../../nls.js';
+ import { MenuId, MenuRegistry } from '../../platform/actions/common/actions.js';
+-import { CommandsRegistry } from '../../platform/commands/common/commands.js';
++import { CommandsRegistry, ICommandService } from '../../platform/commands/common/commands.js';
++import { FileOperationError, FileOperationResult, IFileService } from '../../platform/files/common/files.js';
+ import { ILogService } from '../../platform/log/common/log.js';
+ import { INotificationService, Severity } from '../../platform/notification/common/notification.js';
+ import { IProductService } from '../../platform/product/common/productService.js';
+ import { IStorageService, StorageScope, StorageTarget } from '../../platform/storage/common/storage.js';
++import { IWorkspaceContextService } from '../../platform/workspace/common/workspace.js';
++import * as Hjson from 'hjson';
+ import './media/codeServerKeybar.css';
+ 
++type KeybarActionType = 'command' | 'key' | 'text' | 'noop';
++
++interface IKeybarActionConfig {
++	readonly type: KeybarActionType;
++	readonly command?: string;
++	readonly key?: string;
++	readonly text?: string;
++	readonly ctrl?: boolean;
++	readonly alt?: boolean;
++	readonly shift?: boolean;
++	readonly meta?: boolean;
++}
++
++interface IKeybarButtonConfig {
++	readonly id: string;
++	readonly label: string;
++	readonly tap: IKeybarActionConfig;
++	readonly up?: IKeybarActionConfig;
++	readonly down?: IKeybarActionConfig;
++}
++
++interface IKeybarConfigModel {
++	readonly version: 1;
++	readonly rows: [IKeybarButtonConfig[], IKeybarButtonConfig[]];
++}
++
++const DEFAULT_KEYBAR_CONFIG_HJSON = `
++{
++  version: 1
++  rows: [
++    [
++      { id: "esc", label: "Esc", tap: { type: "command", command: "workbench.action.closeQuickOpen" }, up: { type: "command", command: "workbench.action.showCommands" } }
++      { id: "tab", label: "Tab", tap: { type: "key", key: "Tab" }, up: { type: "command", command: "workbench.action.quickOpen" } }
++      { id: "ctrl", label: "Ctrl", tap: { type: "noop" } }
++      { id: "alt", label: "Alt", tap: { type: "noop" } }
++      { id: "shift", label: "Shift", tap: { type: "noop" } }
++      { id: "find", label: "Find", tap: { type: "command", command: "actions.find" }, down: { type: "command", command: "editor.action.startFindReplaceAction" } }
++    ]
++    [
++      { id: "palette", label: "Palette", tap: { type: "command", command: "workbench.action.showCommands" }, down: { type: "command", command: "workbench.action.quickOpen" } }
++      { id: "open", label: "Open", tap: { type: "command", command: "workbench.action.quickOpen" } }
++      { id: "save", label: "Save", tap: { type: "command", command: "workbench.action.files.save" } }
++      { id: "line", label: "GoLine", tap: { type: "command", command: "workbench.action.gotoLine" } }
++      { id: "close", label: "Close", tap: { type: "command", command: "workbench.action.closeActiveEditor" } }
++      { id: "toggle", label: "Toggle", tap: { type: "command", command: "dermux.keybar.toggleVisibility" } }
++    ]
++  ]
++}
++`;
++
+ export class CodeServerClient extends Disposable {
+ 	static LOGOUT_COMMAND_ID = 'code-server.logout';
+ 	static KEYBAR_TOGGLE_COMMAND_ID = 'dermux.keybar.toggleVisibility';
++	static KEYBAR_RELOAD_COMMAND_ID = 'dermux.keybar.reloadConfig';
+ 	static KEYBAR_VISIBLE_STORAGE_KEY = 'dermux.keybar.visible';
++	static KEYBAR_CONFIG_STORAGE_KEY = 'dermux.keybar.config.hjson';
++	static KEYBAR_WORKSPACE_CONFIG_RELATIVE_PATH = '.dermux-keybar.hjson';
++	static KEYBAR_SWIPE_THRESHOLD_PX = 18;
++	static KEYBAR_SWIPE_COMMIT_PX = 30;
+ 
+ 	private keybarContainer: HTMLElement | undefined;
++	private keybarRowsContainer: HTMLElement | undefined;
+ 	private keybarHandle: HTMLElement | undefined;
+ 	private keybarVisible = true;
++	private readonly keybarConfigWatchStore = this._register(new DisposableStore());
+ 
+ 	constructor (
+ 		@ILogService private logService: ILogService,
+ 		@INotificationService private notificationService: INotificationService,
+ 		@IProductService private productService: IProductService,
+ 		@IStorageService private storageService: IStorageService,
++		@ICommandService private commandService: ICommandService,
++		@IFileService private fileService: IFileService,
++		@IWorkspaceContextService private workspaceContextService: IWorkspaceContextService,
+ 	) {
+ 		super();
+ 	}
+@@ -102,7 +166,7 @@ export class CodeServerClient extends Di
+ 			await this.registerServiceWorker(this.productService.serviceWorker);
+ 		}
+ 
+-		this.addKeybarToggleCommand();
++		this.addKeybarCommands();
+ 		this.createBottomKeybarSkeleton();
+ 	}
+ 
+@@ -190,20 +254,32 @@ export class CodeServerClient extends Di
+ 		}
+ 	}
+ 
+-	private addKeybarToggleCommand(): void {
++	private addKeybarCommands(): void {
+ 		const toggleTitle = localize('dermux.toggleBottomKeybar', "Dermux: Toggle Bottom Keybar");
++		const reloadTitle = localize('dermux.reloadBottomKeybar', "Dermux: Reload Bottom Keybar Config");
+ 
+ 		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_COMMAND_ID, () => {
+ 			this.keybarVisible = !this.keybarVisible;
+ 			this.setKeybarVisibility();
+ 		}));
+ 
++		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_RELOAD_COMMAND_ID, () => {
++			void this.reloadKeybarConfig(true);
++		}));
++
+ 		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
+ 			command: {
+ 				id: CodeServerClient.KEYBAR_TOGGLE_COMMAND_ID,
+ 				title: toggleTitle,
+ 			},
+ 		});
++
++		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
++			command: {
++				id: CodeServerClient.KEYBAR_RELOAD_COMMAND_ID,
++				title: reloadTitle,
++			},
++		});
+ 	}
+ 
+ 	private createBottomKeybarSkeleton(): void {
+@@ -222,9 +298,9 @@ export class CodeServerClient extends Di
+ 		const keybar = document.createElement('div');
+ 		keybar.className = 'cs-dermux-keybar';
+ 
+-		const rowOne = this.createKeybarRow(['Esc', 'Tab', 'Ctrl', 'Alt', 'Shift', 'Find']);
+-		const rowTwo = this.createKeybarRow(['Palette', 'Open', 'Save', 'GoLine', 'Close', 'Toggle']);
+-		keybar.append(rowOne, rowTwo);
++		const rowsContainer = document.createElement('div');
++		rowsContainer.className = 'cs-dermux-keybar-rows';
++		keybar.append(rowsContainer);
+ 
+ 		const handle = document.createElement('button');
+ 		handle.type = 'button';
+@@ -239,6 +315,7 @@ export class CodeServerClient extends Di
+ 		body.append(keybar, handle);
+ 
+ 		this.keybarContainer = keybar;
++		this.keybarRowsContainer = rowsContainer;
+ 		this.keybarHandle = handle;
+ 
+ 		let resizeObserver: ResizeObserver | undefined;
+@@ -247,33 +324,392 @@ export class CodeServerClient extends Di
+ 			resizeObserver.observe(keybar);
+ 		}
+ 		this._register(toDisposable(() => resizeObserver?.disconnect()));
++		const viewportResizeListener = () => this.setKeybarVisibility();
++		window.addEventListener('resize', viewportResizeListener);
++		window.visualViewport?.addEventListener('resize', viewportResizeListener);
++		this._register(toDisposable(() => {
++			window.removeEventListener('resize', viewportResizeListener);
++			window.visualViewport?.removeEventListener('resize', viewportResizeListener);
++		}));
+ 		this._register(toDisposable(() => {
+ 			this.clearKeybarInset();
+ 			handle.remove();
+ 			keybar.remove();
+ 		}));
+ 
++		this.watchWorkspaceKeybarConfig();
++		void this.reloadKeybarConfig(false);
+ 		this.setKeybarVisibility();
+ 	}
+ 
+-	private createKeybarRow(labels: string[]): HTMLDivElement {
++	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
+ 		const row = document.createElement('div');
+ 		row.className = 'cs-dermux-keybar-row';
+ 
+-		for (const label of labels) {
++		for (const buttonConfig of buttons) {
+ 			const button = document.createElement('button');
+ 			button.type = 'button';
+ 			button.className = 'cs-dermux-keybar-btn';
+-			button.textContent = label;
+-			button.addEventListener('click', () => {
+-				this.logService.debug(`[Dermux Keybar] tapped "${label}"`);
+-			});
++			button.textContent = buttonConfig.label;
++			this.bindButtonGesture(button, buttonConfig);
+ 			row.appendChild(button);
+ 		}
+ 
+ 		return row;
+ 	}
+ 
++	private bindButtonGesture(button: HTMLButtonElement, buttonConfig: IKeybarButtonConfig): void {
++		let startY = 0;
++		let latestDeltaY = 0;
++		let trackingPointer = false;
++
++		const resetPreview = () => {
++			button.classList.remove('cs-dermux-keybar-btn-swipe-up', 'cs-dermux-keybar-btn-swipe-down');
++		};
++
++		button.addEventListener('pointerdown', event => {
++			trackingPointer = true;
++			startY = event.clientY;
++			latestDeltaY = 0;
++			button.setPointerCapture(event.pointerId);
++			resetPreview();
++		});
++
++		button.addEventListener('pointermove', event => {
++			if (!trackingPointer) {
++				return;
++			}
++
++			latestDeltaY = event.clientY - startY;
++			resetPreview();
++			if (latestDeltaY <= -CodeServerClient.KEYBAR_SWIPE_THRESHOLD_PX && buttonConfig.up) {
++				button.classList.add('cs-dermux-keybar-btn-swipe-up');
++			} else if (latestDeltaY >= CodeServerClient.KEYBAR_SWIPE_THRESHOLD_PX && buttonConfig.down) {
++				button.classList.add('cs-dermux-keybar-btn-swipe-down');
++			}
++		});
++
++		const finalizeGesture = async (pointerId: number) => {
++			if (!trackingPointer) {
++				return;
++			}
++
++			trackingPointer = false;
++			resetPreview();
++			button.releasePointerCapture(pointerId);
++
++			const action = this.resolveButtonAction(buttonConfig, latestDeltaY);
++			await this.dispatchKeybarAction(action);
++		};
++
++		button.addEventListener('pointerup', event => {
++			void finalizeGesture(event.pointerId);
++		});
++		button.addEventListener('pointercancel', event => {
++			void finalizeGesture(event.pointerId);
++		});
++	}
++
++	private resolveButtonAction(buttonConfig: IKeybarButtonConfig, deltaY: number): IKeybarActionConfig {
++		if (deltaY <= -CodeServerClient.KEYBAR_SWIPE_COMMIT_PX && buttonConfig.up) {
++			return buttonConfig.up;
++		}
++		if (deltaY >= CodeServerClient.KEYBAR_SWIPE_COMMIT_PX && buttonConfig.down) {
++			return buttonConfig.down;
++		}
++		return buttonConfig.tap;
++	}
++
++	private async reloadKeybarConfig(showResultNotification: boolean): Promise<void> {
++		const rowsContainer = this.keybarRowsContainer;
++		if (!rowsContainer) {
++			return;
++		}
++
++		const config = await this.readKeybarConfig();
++		if (!config) {
++			return;
++		}
++
++		rowsContainer.textContent = '';
++		for (const rowConfig of config.rows) {
++			rowsContainer.appendChild(this.createKeybarRow(rowConfig));
++		}
++
++		this.setKeybarVisibility();
++		if (showResultNotification) {
++			this.notificationService.notify({
++				severity: Severity.Info,
++				message: localize('dermux.keybarReloaded', "Dermux keybar config reloaded."),
++			});
++		}
++	}
++
++	private async readKeybarConfig(): Promise<IKeybarConfigModel | undefined> {
++		const workspaceRaw = await this.readWorkspaceKeybarConfigRaw();
++		const configuredRaw = this.storageService.get(CodeServerClient.KEYBAR_CONFIG_STORAGE_KEY, StorageScope.APPLICATION);
++		const source = workspaceRaw?.trim() || configuredRaw?.trim() || DEFAULT_KEYBAR_CONFIG_HJSON;
++
++		const parsedConfig = this.parseAndValidateKeybarConfig(source);
++		if (parsedConfig) {
++			return parsedConfig;
++		}
++
++		this.notificationService.notify({
++			severity: Severity.Warning,
++			message: localize('dermux.invalidKeybarConfig', "Invalid Dermux keybar config. Falling back to default."),
++		});
++
++		return this.parseAndValidateKeybarConfig(DEFAULT_KEYBAR_CONFIG_HJSON);
++	}
++
++	private watchWorkspaceKeybarConfig(): void {
++		const configUri = this.getWorkspaceKeybarConfigUri();
++		if (!configUri) {
++			return;
++		}
++
++		this.keybarConfigWatchStore.clear();
++		this.keybarConfigWatchStore.add(this.fileService.watch(configUri));
++		this.keybarConfigWatchStore.add(this.fileService.onDidFilesChange(event => {
++			if (event.contains(configUri)) {
++				void this.reloadKeybarConfig(false);
++			}
++		}));
++	}
++
++	private async readWorkspaceKeybarConfigRaw(): Promise<string | undefined> {
++		const configUri = this.getWorkspaceKeybarConfigUri();
++		if (!configUri) {
++			return undefined;
++		}
++
++		try {
++			const file = await this.fileService.readFile(configUri);
++			return file.value.toString();
++		} catch (error) {
++			if (error instanceof FileOperationError && error.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
++				return undefined;
++			}
++			this.logService.warn(`[Dermux Keybar] failed to read config file: ${String(error)}`);
++			return undefined;
++		}
++	}
++
++	private getWorkspaceKeybarConfigUri() {
++		const workspace = this.workspaceContextService.getWorkspace();
++		const firstFolder = workspace.folders[0];
++		if (!firstFolder) {
++			return undefined;
++		}
++
++		return joinPath(firstFolder.uri, CodeServerClient.KEYBAR_WORKSPACE_CONFIG_RELATIVE_PATH);
++	}
++
++	private parseAndValidateKeybarConfig(rawHjson: string): IKeybarConfigModel | undefined {
++		try {
++			const parsed = Hjson.parse(rawHjson);
++			return this.toKeybarConfigModel(parsed);
++		} catch (error) {
++			this.logService.warn(`[Dermux Keybar] failed to parse config: ${String(error)}`);
++			return undefined;
++		}
++	}
++
++	private toKeybarConfigModel(parsed: unknown): IKeybarConfigModel | undefined {
++		if (typeof parsed !== 'object' || parsed === null) {
++			return undefined;
++		}
++
++		const configLike = parsed as { version?: unknown; rows?: unknown };
++		if (configLike.version !== 1 || !Array.isArray(configLike.rows) || configLike.rows.length !== 2) {
++			return undefined;
++		}
++
++		const firstRow = this.toKeybarRow(configLike.rows[0]);
++		const secondRow = this.toKeybarRow(configLike.rows[1]);
++		if (!firstRow || !secondRow) {
++			return undefined;
++		}
++
++		return {
++			version: 1,
++			rows: [firstRow, secondRow],
++		};
++	}
++
++	private toKeybarRow(row: unknown): IKeybarButtonConfig[] | undefined {
++		if (!Array.isArray(row) || row.length < 1) {
++			return undefined;
++		}
++
++		const buttons: IKeybarButtonConfig[] = [];
++		for (const button of row) {
++			const normalized = this.toKeybarButton(button);
++			if (!normalized) {
++				return undefined;
++			}
++			buttons.push(normalized);
++		}
++
++		return buttons;
++	}
++
++	private toKeybarButton(rawButton: unknown): IKeybarButtonConfig | undefined {
++		if (typeof rawButton !== 'object' || rawButton === null) {
++			return undefined;
++		}
++
++		const buttonLike = rawButton as { id?: unknown; label?: unknown; tap?: unknown; up?: unknown; down?: unknown };
++		if (typeof buttonLike.id !== 'string' || typeof buttonLike.label !== 'string') {
++			return undefined;
++		}
++
++		const tap = this.toKeybarAction(buttonLike.tap);
++		if (!tap) {
++			return undefined;
++		}
++
++		const up = buttonLike.up === undefined ? undefined : this.toKeybarAction(buttonLike.up);
++		const down = buttonLike.down === undefined ? undefined : this.toKeybarAction(buttonLike.down);
++		if (buttonLike.up !== undefined && !up) {
++			return undefined;
++		}
++		if (buttonLike.down !== undefined && !down) {
++			return undefined;
++		}
++
++		return { id: buttonLike.id, label: buttonLike.label, tap, up, down };
++	}
++
++	private toKeybarAction(rawAction: unknown): IKeybarActionConfig | undefined {
++		if (typeof rawAction !== 'object' || rawAction === null) {
++			return undefined;
++		}
++
++		const actionLike = rawAction as { type?: unknown; command?: unknown; key?: unknown; text?: unknown; ctrl?: unknown; alt?: unknown; shift?: unknown; meta?: unknown };
++		if (actionLike.type !== 'command' && actionLike.type !== 'key' && actionLike.type !== 'text' && actionLike.type !== 'noop') {
++			return undefined;
++		}
++
++		if (actionLike.type === 'command' && typeof actionLike.command !== 'string') {
++			return undefined;
++		}
++		if (actionLike.type === 'key' && typeof actionLike.key !== 'string') {
++			return undefined;
++		}
++		if (actionLike.type === 'text' && typeof actionLike.text !== 'string') {
++			return undefined;
++		}
++		if (actionLike.ctrl !== undefined && typeof actionLike.ctrl !== 'boolean') {
++			return undefined;
++		}
++		if (actionLike.alt !== undefined && typeof actionLike.alt !== 'boolean') {
++			return undefined;
++		}
++		if (actionLike.shift !== undefined && typeof actionLike.shift !== 'boolean') {
++			return undefined;
++		}
++		if (actionLike.meta !== undefined && typeof actionLike.meta !== 'boolean') {
++			return undefined;
++		}
++
++		return {
++			type: actionLike.type,
++			command: typeof actionLike.command === 'string' ? actionLike.command : undefined,
++			key: typeof actionLike.key === 'string' ? actionLike.key : undefined,
++			text: typeof actionLike.text === 'string' ? actionLike.text : undefined,
++			ctrl: typeof actionLike.ctrl === 'boolean' ? actionLike.ctrl : undefined,
++			alt: typeof actionLike.alt === 'boolean' ? actionLike.alt : undefined,
++			shift: typeof actionLike.shift === 'boolean' ? actionLike.shift : undefined,
++			meta: typeof actionLike.meta === 'boolean' ? actionLike.meta : undefined,
++		};
++	}
++
++	private async dispatchKeybarAction(action: IKeybarActionConfig): Promise<boolean> {
++		if (action.type === 'noop') {
++			return true;
++		}
++
++		if (action.type === 'command') {
++			if (!action.command) {
++				return false;
++			}
++			try {
++				await this.commandService.executeCommand(action.command);
++				return true;
++			} catch (error) {
++				this.logService.warn(`[Dermux Keybar] command failed "${action.command}": ${String(error)}`);
++				return false;
++			}
++		}
++
++		if (action.type === 'text') {
++			if (!action.text) {
++				return false;
++			}
++			return this.insertText(action.text);
++		}
++
++		if (action.type === 'key') {
++			if (!action.key) {
++				return false;
++			}
++			return this.dispatchSyntheticKey(action);
++		}
++
++		return false;
++	}
++
++	private insertText(text: string): boolean {
++		const activeElement = document.activeElement;
++
++		if (activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement) {
++			const start = activeElement.selectionStart ?? activeElement.value.length;
++			const end = activeElement.selectionEnd ?? activeElement.value.length;
++			activeElement.setRangeText(text, start, end, 'end');
++			activeElement.dispatchEvent(new Event('input', { bubbles: true }));
++			return true;
++		}
++
++		if (activeElement instanceof HTMLElement && activeElement.isContentEditable) {
++			return document.execCommand('insertText', false, text);
++		}
++
++		return false;
++	}
++
++	private dispatchSyntheticKey(action: IKeybarActionConfig): boolean {
++		const activeElement = document.activeElement;
++		const target = activeElement instanceof HTMLElement ? activeElement : document.body;
++		const key = action.key!;
++
++		const eventInit: KeyboardEventInit = {
++			key,
++			code: this.toKeyboardCode(key),
++			ctrlKey: action.ctrl === true,
++			altKey: action.alt === true,
++			shiftKey: action.shift === true,
++			metaKey: action.meta === true,
++			bubbles: true,
++			cancelable: true,
++		};
++
++		const didDispatch = target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
++		target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
++		return didDispatch;
++	}
++
++	private toKeyboardCode(key: string): string {
++		if (key.length === 1 && /^[a-zA-Z]$/.test(key)) {
++			return `Key${key.toUpperCase()}`;
++		}
++		if (key.length === 1 && /^[0-9]$/.test(key)) {
++			return `Digit${key}`;
++		}
++		return key;
++	}
++
+ 	private setKeybarVisibility(): void {
+ 		const keybar = this.keybarContainer;
+ 		const handle = this.keybarHandle;

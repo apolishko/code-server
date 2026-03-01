@@ -1,0 +1,235 @@
+Add an initial Dermux bottom keybar skeleton for mobile web sessions.
+
+This patch introduces:
+1. Fixed bottom keybar host rendered from `CodeServerClient`.
+2. Command palette toggle command.
+3. Dynamic workbench bottom inset and safe-area-aware CSS.
+
+Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
++++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
+@@ -1,4 +1,5 @@
+-import { Disposable } from "../../base/common/lifecycle.js";
++import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
++import { isMobile } from '../../base/common/platform.js';
+ import { localize } from '../../nls.js';
+ import { MenuId, MenuRegistry } from '../../platform/actions/common/actions.js';
+ import { CommandsRegistry } from '../../platform/commands/common/commands.js';
+@@ -6,9 +7,16 @@ import { ILogService } from '../../platf
+ import { INotificationService, Severity } from '../../platform/notification/common/notification.js';
+ import { IProductService } from '../../platform/product/common/productService.js';
+ import { IStorageService, StorageScope, StorageTarget } from '../../platform/storage/common/storage.js';
++import './media/codeServerKeybar.css';
+ 
+ export class CodeServerClient extends Disposable {
+ 	static LOGOUT_COMMAND_ID = 'code-server.logout';
++	static KEYBAR_TOGGLE_COMMAND_ID = 'dermux.keybar.toggleVisibility';
++	static KEYBAR_VISIBLE_STORAGE_KEY = 'dermux.keybar.visible';
++
++	private keybarContainer: HTMLElement | undefined;
++	private keybarHandle: HTMLElement | undefined;
++	private keybarVisible = true;
+ 
+ 	constructor (
+ 		@ILogService private logService: ILogService,
+@@ -93,6 +101,9 @@ export class CodeServerClient extends Di
+ 		if (this.productService.serviceWorker) {
+ 			await this.registerServiceWorker(this.productService.serviceWorker);
+ 		}
++
++		this.addKeybarToggleCommand();
++		this.createBottomKeybarSkeleton();
+ 	}
+ 
+ 	private checkUpdates(updateEndpoint: string) {
+@@ -178,4 +189,117 @@ export class CodeServerClient extends Di
+ 			}
+ 		}
+ 	}
++
++	private addKeybarToggleCommand(): void {
++		const toggleTitle = localize('dermux.toggleBottomKeybar', "Dermux: Toggle Bottom Keybar");
++
++		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_COMMAND_ID, () => {
++			this.keybarVisible = !this.keybarVisible;
++			this.setKeybarVisibility();
++		}));
++
++		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
++			command: {
++				id: CodeServerClient.KEYBAR_TOGGLE_COMMAND_ID,
++				title: toggleTitle,
++			},
++		});
++	}
++
++	private createBottomKeybarSkeleton(): void {
++		if (!isMobile) {
++			return;
++		}
++
++		const body = document.body;
++		if (!body) {
++			return;
++		}
++
++		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
++		this.keybarVisible = storedVisibility ?? true;
++
++		const keybar = document.createElement('div');
++		keybar.className = 'cs-dermux-keybar';
++
++		const rowOne = this.createKeybarRow(['Esc', 'Tab', 'Ctrl', 'Alt', 'Shift', 'Find']);
++		const rowTwo = this.createKeybarRow(['Palette', 'Open', 'Save', 'GoLine', 'Close', 'Toggle']);
++		keybar.append(rowOne, rowTwo);
++
++		const handle = document.createElement('button');
++		handle.type = 'button';
++		handle.className = 'cs-dermux-keybar-handle';
++		handle.textContent = 'Keyboard';
++		handle.addEventListener('click', () => {
++			this.keybarVisible = true;
++			this.setKeybarVisibility();
++		});
++
++		body.classList.add('cs-dermux-keybar-enabled');
++		body.append(keybar, handle);
++
++		this.keybarContainer = keybar;
++		this.keybarHandle = handle;
++
++		let resizeObserver: ResizeObserver | undefined;
++		if (typeof ResizeObserver !== 'undefined') {
++			resizeObserver = new ResizeObserver(() => this.setKeybarVisibility());
++			resizeObserver.observe(keybar);
++		}
++		this._register(toDisposable(() => resizeObserver?.disconnect()));
++		this._register(toDisposable(() => {
++			this.clearKeybarInset();
++			handle.remove();
++			keybar.remove();
++		}));
++
++		this.setKeybarVisibility();
++	}
++
++	private createKeybarRow(labels: string[]): HTMLDivElement {
++		const row = document.createElement('div');
++		row.className = 'cs-dermux-keybar-row';
++
++		for (const label of labels) {
++			const button = document.createElement('button');
++			button.type = 'button';
++			button.className = 'cs-dermux-keybar-btn';
++			button.textContent = label;
++			button.addEventListener('click', () => {
++				this.logService.debug(`[Dermux Keybar] tapped "${label}"`);
++			});
++			row.appendChild(button);
++		}
++
++		return row;
++	}
++
++	private setKeybarVisibility(): void {
++		const keybar = this.keybarContainer;
++		const handle = this.keybarHandle;
++		if (!keybar || !handle) {
++			return;
++		}
++
++		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
++		handle.classList.toggle('cs-dermux-keybar-handle-hidden', this.keybarVisible);
++
++		if (this.keybarVisible) {
++			const keybarHeight = `${Math.ceil(keybar.getBoundingClientRect().height)}px`;
++			document.documentElement.style.setProperty('--cs-dermux-keybar-height', keybarHeight);
++		} else {
++			this.clearKeybarInset();
++		}
++
++		this.storageService.store(
++			CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY,
++			this.keybarVisible,
++			StorageScope.APPLICATION,
++			StorageTarget.USER,
++		);
++	}
++
++	private clearKeybarInset(): void {
++		document.documentElement.style.setProperty('--cs-dermux-keybar-height', '0px');
++	}
+ }
+Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
+===================================================================
+--- /dev/null
++++ code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
+@@ -0,0 +1,67 @@
++:root {
++	--cs-dermux-keybar-height: 0px;
++	--cs-dermux-safe-area-bottom: env(safe-area-inset-bottom, 0px);
++}
++
++body.cs-dermux-keybar-enabled .monaco-workbench {
++	padding-bottom: calc(var(--cs-dermux-keybar-height) + var(--cs-dermux-safe-area-bottom));
++	box-sizing: border-box;
++}
++
++.cs-dermux-keybar {
++	position: fixed;
++	left: 0;
++	right: 0;
++	bottom: 0;
++	display: flex;
++	flex-direction: column;
++	gap: 6px;
++	padding: 8px 8px calc(8px + var(--cs-dermux-safe-area-bottom));
++	background: color-mix(in srgb, var(--vscode-editor-background) 92%, black);
++	border-top: 1px solid var(--vscode-widget-border);
++	z-index: 1700;
++}
++
++.cs-dermux-keybar.cs-dermux-keybar-hidden {
++	display: none;
++}
++
++.cs-dermux-keybar-row {
++	display: grid;
++	grid-template-columns: repeat(6, minmax(0, 1fr));
++	gap: 6px;
++}
++
++.cs-dermux-keybar-btn {
++	height: 40px;
++	min-width: 40px;
++	border: 1px solid var(--vscode-widget-border);
++	border-radius: 6px;
++	background: var(--vscode-button-secondaryBackground);
++	color: var(--vscode-button-secondaryForeground);
++	font-size: 11px;
++	font-weight: 600;
++}
++
++.cs-dermux-keybar-btn:active {
++	transform: translateY(1px);
++}
++
++.cs-dermux-keybar-handle {
++	position: fixed;
++	right: 10px;
++	bottom: calc(10px + var(--cs-dermux-safe-area-bottom));
++	height: 32px;
++	padding: 0 10px;
++	border: 1px solid var(--vscode-widget-border);
++	border-radius: 16px;
++	background: var(--vscode-button-background);
++	color: var(--vscode-button-foreground);
++	font-size: 11px;
++	font-weight: 600;
++	z-index: 1701;
++}
++
++.cs-dermux-keybar-handle.cs-dermux-keybar-handle-hidden {
++	display: none;
++}
