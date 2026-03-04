@@ -51,10 +51,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
-@@ -1,28 +1,97 @@
+@@ -1,28 +1,116 @@
 -import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
 -import { isMobile } from '../../base/common/platform.js';
 +import { Disposable, DisposableStore, toDisposable } from "../../base/common/lifecycle.js";
++import { IME } from '../../base/common/ime.js';
 +import { isAndroid, isMobile } from '../../base/common/platform.js';
 +import { joinPath } from '../../base/common/resources.js';
  import { localize } from '../../nls.js';
@@ -75,6 +76,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	readonly type: KeybarActionType;
 +	readonly command?: string;
 +	readonly key?: string;
++	readonly code?: string;
 +	readonly text?: string;
 +	readonly ctrl?: boolean;
 +	readonly alt?: boolean;
@@ -99,6 +101,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	parse(text: string, options?: unknown): unknown;
 +	stringify(value: unknown, options?: unknown): string;
 +}
++
++type KeybarModifier = 'ctrl' | 'alt' | 'shift' | 'meta';
++type KeybarModifierState = 'off' | 'latched' | 'locked';
 +
 +const DEFAULT_KEYBAR_CONFIG: IKeybarConfigModel = {
 +	version: 1,
@@ -126,8 +131,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	static LOGOUT_COMMAND_ID = 'code-server.logout';
  	static KEYBAR_TOGGLE_COMMAND_ID = 'dermux.keybar.toggleVisibility';
 +	static KEYBAR_RELOAD_COMMAND_ID = 'dermux.keybar.reloadConfig';
++	static KEYBAR_TOGGLE_LAYOUT_COMMAND_ID = 'dermux.keybar.toggleLayout';
++	static KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID = 'dermux.keybar.toggleNativeIme';
  	static KEYBAR_VISIBLE_STORAGE_KEY = 'dermux.keybar.visible';
 +	static KEYBAR_CONFIG_STORAGE_KEY = 'dermux.keybar.config.hjson';
++	static KEYBAR_LAYOUT_STORAGE_KEY = 'dermux.keybar.layout';
++	static KEYBAR_NATIVE_IME_ENABLED_STORAGE_KEY = 'dermux.keybar.nativeIme.enabled';
++	static KEYBAR_NATIVE_IME_MODE_ATTRIBUTE = 'data-cs-native-ime';
 +	static KEYBAR_WORKSPACE_CONFIG_RELATIVE_PATH = '.dermux-keybar.hjson';
 +	static KEYBAR_SWIPE_THRESHOLD_PX = 18;
 +	static KEYBAR_SWIPE_COMMIT_PX = 30;
@@ -138,6 +148,15 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private keybarVisible = true;
 +	private keyboardOverlapPx = 0;
 +	private keybarHeightPx = 0;
++	private keybarLayout: 'en' | 'ru' = 'en';
++	private nativeImeEnabled = false;
++	private readonly modifierButtonByKind = new Map<KeybarModifier, HTMLButtonElement>();
++	private readonly modifierState: Record<KeybarModifier, KeybarModifierState> = {
++		ctrl: 'off',
++		alt: 'off',
++		shift: 'off',
++		meta: 'off',
++	};
 +	private readonly keybarConfigWatchStore = this._register(new DisposableStore());
 +	private hjsonModulePromise: Promise<IHjsonModule | undefined> | undefined;
  
@@ -152,23 +171,125 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	) {
  		super();
  	}
-@@ -102,7 +171,7 @@ export class CodeServerClient extends Di
+@@ -102,7 +190,8 @@ export class CodeServerClient extends Di
  			await this.registerServiceWorker(this.productService.serviceWorker);
  		}
  
 -		this.addKeybarToggleCommand();
++		this.initializeNativeImeControl();
 +		this.addKeybarCommands();
  		this.createBottomKeybarSkeleton();
  	}
  
-@@ -190,24 +259,36 @@ export class CodeServerClient extends Di
+@@ -190,24 +279,166 @@ export class CodeServerClient extends Di
  		}
  	}
  
 -	private addKeybarToggleCommand(): void {
++	private initializeNativeImeControl(): void {
++		if (!isMobile && !isAndroid) {
++			this.nativeImeEnabled = true;
++			this.applyNativeImeMode(false);
++			return;
++		}
++
++		const storedNativeImeEnabled = this.storageService.getBoolean(CodeServerClient.KEYBAR_NATIVE_IME_ENABLED_STORAGE_KEY, StorageScope.APPLICATION);
++		this.nativeImeEnabled = storedNativeImeEnabled ?? false;
++		this.applyNativeImeMode(false);
++
++		const focusInListener = (event: FocusEvent) => this.applyNativeImePolicyToEventTarget(event.target);
++		document.addEventListener('focusin', focusInListener, true);
++		this._register(toDisposable(() => {
++			document.removeEventListener('focusin', focusInListener, true);
++		}));
++	}
++
++	private setNativeImeEnabled(enabled: boolean, showNotification: boolean): void {
++		if (this.nativeImeEnabled === enabled) {
++			return;
++		}
++
++		this.nativeImeEnabled = enabled;
++		this.applyNativeImeMode(showNotification);
++		void this.reloadKeybarConfig(false);
++	}
++
++	private applyNativeImeMode(showNotification: boolean): void {
++		if (this.nativeImeEnabled) {
++			IME.enable();
++		} else {
++			IME.disable();
++		}
++
++		this.storageService.store(
++			CodeServerClient.KEYBAR_NATIVE_IME_ENABLED_STORAGE_KEY,
++			this.nativeImeEnabled,
++			StorageScope.APPLICATION,
++			StorageTarget.USER,
++		);
++
++		const nativeImeMode = this.nativeImeEnabled ? 'on' : 'off';
++		document.documentElement.setAttribute(CodeServerClient.KEYBAR_NATIVE_IME_MODE_ATTRIBUTE, nativeImeMode);
++		this.applyNativeImePolicyToAllInputs();
++		window.dispatchEvent(new CustomEvent('cs-native-ime-mode-changed', { detail: nativeImeMode }));
++
++		if (showNotification) {
++			this.notificationService.notify({
++				severity: Severity.Info,
++				message: this.nativeImeEnabled
++					? localize('dermux.nativeImeEnabled', "Dermux native keyboard enabled.")
++					: localize('dermux.nativeImeDisabled', "Dermux native keyboard disabled."),
++			});
++		}
++	}
++
++	private applyNativeImePolicyToAllInputs(): void {
++		const inputElements = document.querySelectorAll<HTMLElement>('input, textarea, [contenteditable="true"], [contenteditable=""]');
++		for (const element of inputElements) {
++			this.applyNativeImePolicyToElement(element);
++		}
++	}
++
++	private applyNativeImePolicyToEventTarget(target: EventTarget | null): void {
++		if (!(target instanceof HTMLElement)) {
++			return;
++		}
++
++		const contentEditableHost = target.closest('[contenteditable="true"], [contenteditable=""]');
++		if (contentEditableHost instanceof HTMLElement) {
++			this.applyNativeImePolicyToElement(contentEditableHost);
++			return;
++		}
++
++		if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
++			this.applyNativeImePolicyToElement(target);
++			return;
++		}
++
++		const inputAncestor = target.closest('input, textarea');
++		if (inputAncestor instanceof HTMLElement) {
++			this.applyNativeImePolicyToElement(inputAncestor);
++		}
++	}
++
++	private applyNativeImePolicyToElement(element: HTMLElement): void {
++		if (this.nativeImeEnabled) {
++			element.removeAttribute('inputmode');
++			element.removeAttribute('virtualkeyboardpolicy');
++			return;
++		}
++
++		if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable) {
++			element.setAttribute('inputmode', 'none');
++			element.setAttribute('virtualkeyboardpolicy', 'manual');
++		}
++	}
++
 +	private addKeybarCommands(): void {
  		const toggleTitle = localize('dermux.toggleBottomKeybar', "Dermux: Toggle Bottom Keybar");
 +		const reloadTitle = localize('dermux.reloadBottomKeybar', "Dermux: Reload Bottom Keybar Config");
++		const toggleLayoutTitle = localize('dermux.toggleBottomKeybarLayout', "Dermux: Toggle Bottom Keybar Layout");
++		const toggleNativeImeTitle = localize('dermux.toggleNativeIme', "Dermux: Toggle Native Keyboard");
  
  		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_COMMAND_ID, () => {
  			this.keybarVisible = !this.keybarVisible;
@@ -177,6 +298,21 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
 +		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_RELOAD_COMMAND_ID, () => {
 +			void this.reloadKeybarConfig(true);
++		}));
++
++		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_LAYOUT_COMMAND_ID, () => {
++			this.keybarLayout = this.keybarLayout === 'en' ? 'ru' : 'en';
++			this.storageService.store(
++				CodeServerClient.KEYBAR_LAYOUT_STORAGE_KEY,
++				this.keybarLayout,
++				StorageScope.APPLICATION,
++				StorageTarget.USER,
++			);
++			void this.reloadKeybarConfig(false);
++		}));
++
++		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID, () => {
++			this.setNativeImeEnabled(!this.nativeImeEnabled, true);
 +		}));
 +
  		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
@@ -192,6 +328,20 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				title: reloadTitle,
 +			},
 +		});
++
++		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
++			command: {
++				id: CodeServerClient.KEYBAR_TOGGLE_LAYOUT_COMMAND_ID,
++				title: toggleLayoutTitle,
++			},
++		});
++
++		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
++			command: {
++				id: CodeServerClient.KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID,
++				title: toggleNativeImeTitle,
++			},
++		});
  	}
  
  	private createBottomKeybarSkeleton(): void {
@@ -200,7 +350,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			return;
  		}
  
-@@ -222,9 +303,9 @@ export class CodeServerClient extends Di
+@@ -218,13 +449,15 @@ export class CodeServerClient extends Di
+ 
+ 		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
+ 		this.keybarVisible = storedVisibility ?? true;
++		const storedLayout = this.storageService.get(CodeServerClient.KEYBAR_LAYOUT_STORAGE_KEY, StorageScope.APPLICATION);
++		this.keybarLayout = storedLayout === 'ru' ? 'ru' : 'en';
+ 
  		const keybar = document.createElement('div');
  		keybar.className = 'cs-dermux-keybar';
  
@@ -213,7 +369,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
  		const handle = document.createElement('button');
  		handle.type = 'button';
-@@ -239,6 +320,7 @@ export class CodeServerClient extends Di
+@@ -239,6 +472,7 @@ export class CodeServerClient extends Di
  		body.append(keybar, handle);
  
  		this.keybarContainer = keybar;
@@ -221,7 +377,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +329,434 @@ export class CodeServerClient extends Di
+@@ -247,33 +481,646 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -232,13 +388,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +		}));
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -255,6 +411,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
++		row.style.gridTemplateColumns = `repeat(${Math.max(1, buttons.length)}, minmax(0, 1fr))`;
  
 -		for (const label of labels) {
 +		for (const buttonConfig of buttons) {
@@ -265,11 +422,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 -			button.addEventListener('click', () => {
 -				this.logService.debug(`[Dermux Keybar] tapped "${label}"`);
 -			});
++			button.tabIndex = -1;
 +			button.textContent = buttonConfig.label;
 +			this.bindButtonGesture(button, buttonConfig);
++			const modifierKind = this.toModifierKind(buttonConfig.id);
++			if (modifierKind) {
++				this.modifierButtonByKind.set(modifierKind, button);
++			}
  			row.appendChild(button);
  		}
  
++		this.renderModifierButtons();
  		return row;
  	}
  
@@ -277,15 +440,18 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		let startY = 0;
 +		let latestDeltaY = 0;
 +		let trackingPointer = false;
++		let focusRestoreTarget: HTMLElement | undefined;
 +
 +		const resetPreview = () => {
 +			button.classList.remove('cs-dermux-keybar-btn-swipe-up', 'cs-dermux-keybar-btn-swipe-down');
 +		};
 +
 +		button.addEventListener('pointerdown', event => {
++			event.preventDefault();
 +			trackingPointer = true;
 +			startY = event.clientY;
 +			latestDeltaY = 0;
++			focusRestoreTarget = this.captureRestorableFocusTarget();
 +			button.setPointerCapture(event.pointerId);
 +			resetPreview();
 +		});
@@ -314,7 +480,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			button.releasePointerCapture(pointerId);
 +
 +			const action = this.resolveButtonAction(buttonConfig, latestDeltaY);
++			if (this.tryToggleModifierFromAction(buttonConfig, action)) {
++				this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
++				return;
++			}
 +			await this.dispatchKeybarAction(action);
++			this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
 +		};
 +
 +		button.addEventListener('pointerup', event => {
@@ -335,6 +506,167 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return buttonConfig.tap;
 +	}
 +
++	private toModifierKind(buttonId: string): KeybarModifier | undefined {
++		switch (buttonId.toLowerCase()) {
++			case 'ctrl':
++				return 'ctrl';
++			case 'alt':
++				return 'alt';
++			case 'shift':
++				return 'shift';
++			case 'meta':
++				return 'meta';
++			default:
++				return undefined;
++		}
++	}
++
++	private buildVirtualKeyboardRows(): IKeybarButtonConfig[][] {
++		const createLetterKey = (code: string, enLetter: string, ruLetter: string): IKeybarButtonConfig => {
++			const key = this.keybarLayout === 'ru' ? ruLetter : enLetter;
++			return {
++				id: `vk-${code.toLowerCase()}`,
++				label: key,
++				tap: { type: 'key', key, code },
++			};
++		};
++
++		return [
++			[
++				createLetterKey('KeyQ', 'q', 'й'),
++				createLetterKey('KeyW', 'w', 'ц'),
++				createLetterKey('KeyE', 'e', 'у'),
++				createLetterKey('KeyR', 'r', 'к'),
++				createLetterKey('KeyT', 't', 'е'),
++				createLetterKey('KeyY', 'y', 'н'),
++				createLetterKey('KeyU', 'u', 'г'),
++				createLetterKey('KeyI', 'i', 'ш'),
++				createLetterKey('KeyO', 'o', 'щ'),
++				createLetterKey('KeyP', 'p', 'з'),
++			],
++			[
++				createLetterKey('KeyA', 'a', 'ф'),
++				createLetterKey('KeyS', 's', 'ы'),
++				createLetterKey('KeyD', 'd', 'в'),
++				createLetterKey('KeyF', 'f', 'а'),
++				createLetterKey('KeyG', 'g', 'п'),
++				createLetterKey('KeyH', 'h', 'р'),
++				createLetterKey('KeyJ', 'j', 'о'),
++				createLetterKey('KeyK', 'k', 'л'),
++				createLetterKey('KeyL', 'l', 'д'),
++			],
++			[
++				createLetterKey('KeyZ', 'z', 'я'),
++				createLetterKey('KeyX', 'x', 'ч'),
++				createLetterKey('KeyC', 'c', 'с'),
++				createLetterKey('KeyV', 'v', 'м'),
++				createLetterKey('KeyB', 'b', 'и'),
++				createLetterKey('KeyN', 'n', 'т'),
++				createLetterKey('KeyM', 'm', 'ь'),
++				{ id: 'vk-backspace', label: 'Bksp', tap: { type: 'key', key: 'Backspace', code: 'Backspace' } },
++			],
++				[
++					{
++						id: 'vk-lang',
++						label: this.keybarLayout.toUpperCase(),
++						tap: { type: 'command', command: CodeServerClient.KEYBAR_TOGGLE_LAYOUT_COMMAND_ID },
++					},
++					{
++						id: 'vk-ime',
++						label: this.nativeImeEnabled ? 'IME On' : 'IME Off',
++						tap: { type: 'command', command: CodeServerClient.KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID },
++					},
++					{ id: 'vk-space', label: 'Space', tap: { type: 'key', key: ' ', code: 'Space' } },
++					{ id: 'vk-left', label: '<-', tap: { type: 'key', key: 'ArrowLeft', code: 'ArrowLeft' } },
++					{ id: 'vk-down', label: 'v', tap: { type: 'key', key: 'ArrowDown', code: 'ArrowDown' } },
++				{ id: 'vk-up', label: '^', tap: { type: 'key', key: 'ArrowUp', code: 'ArrowUp' } },
++				{ id: 'vk-right', label: '->', tap: { type: 'key', key: 'ArrowRight', code: 'ArrowRight' } },
++				{ id: 'vk-enter', label: 'Enter', tap: { type: 'key', key: 'Enter', code: 'Enter' } },
++			],
++		];
++	}
++
++	private captureRestorableFocusTarget(): HTMLElement | undefined {
++		const activeElement = document.activeElement;
++		if (!(activeElement instanceof HTMLElement)) {
++			return undefined;
++		}
++		if (activeElement === document.body) {
++			return undefined;
++		}
++		if (this.keybarContainer?.contains(activeElement) || this.keybarHandle?.contains(activeElement)) {
++			return undefined;
++		}
++		return activeElement;
++	}
++
++	private restoreFocusAfterKeybarInteraction(target: HTMLElement | undefined): void {
++		try {
++			target?.focus({ preventScroll: true });
++		} catch {
++			// Ignore focus restore failures; target may be detached.
++		}
++	}
++
++	private tryToggleModifierFromAction(buttonConfig: IKeybarButtonConfig, action: IKeybarActionConfig): boolean {
++		if (action.type !== 'noop') {
++			return false;
++		}
++
++		const modifierKind = this.toModifierKind(buttonConfig.id);
++		if (!modifierKind) {
++			return false;
++		}
++
++		const currentState = this.modifierState[modifierKind];
++		let nextState: KeybarModifierState;
++		switch (currentState) {
++			case 'off':
++				nextState = 'latched';
++				break;
++			case 'latched':
++				nextState = 'locked';
++				break;
++			case 'locked':
++				nextState = 'off';
++				break;
++		}
++
++		this.modifierState[modifierKind] = nextState;
++		this.renderModifierButtons();
++		return true;
++	}
++
++	private renderModifierButtons(): void {
++		for (const [modifierKind, button] of this.modifierButtonByKind) {
++			const state = this.modifierState[modifierKind];
++			button.classList.toggle('cs-dermux-keybar-btn-active', state !== 'off');
++			button.classList.toggle('cs-dermux-keybar-btn-locked', state === 'locked');
++		}
++	}
++
++	private consumeLatchedModifiers(): void {
++		let didChange = false;
++		for (const modifierKind of Object.keys(this.modifierState) as KeybarModifier[]) {
++			if (this.modifierState[modifierKind] === 'latched') {
++				this.modifierState[modifierKind] = 'off';
++				didChange = true;
++			}
++		}
++		if (didChange) {
++			this.renderModifierButtons();
++		}
++	}
++
++	private getActiveModifierFlags(action: IKeybarActionConfig): { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean } {
++		return {
++			ctrl: action.ctrl === true || this.modifierState.ctrl !== 'off',
++			alt: action.alt === true || this.modifierState.alt !== 'off',
++			shift: action.shift === true || this.modifierState.shift !== 'off',
++			meta: action.meta === true || this.modifierState.meta !== 'off',
++		};
++	}
++
 +	private async reloadKeybarConfig(showResultNotification: boolean): Promise<void> {
 +		const rowsContainer = this.keybarRowsContainer;
 +		if (!rowsContainer) {
@@ -347,7 +679,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +
 +		rowsContainer.textContent = '';
++		this.modifierButtonByKind.clear();
 +		for (const rowConfig of config.rows) {
++			rowsContainer.appendChild(this.createKeybarRow(rowConfig));
++		}
++		for (const rowConfig of this.buildVirtualKeyboardRows()) {
 +			rowsContainer.appendChild(this.createKeybarRow(rowConfig));
 +		}
 +
@@ -537,7 +873,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			return undefined;
 +		}
 +
-+		const actionLike = rawAction as { type?: unknown; command?: unknown; key?: unknown; text?: unknown; ctrl?: unknown; alt?: unknown; shift?: unknown; meta?: unknown };
++		const actionLike = rawAction as { type?: unknown; command?: unknown; key?: unknown; code?: unknown; text?: unknown; ctrl?: unknown; alt?: unknown; shift?: unknown; meta?: unknown };
 +		if (actionLike.type !== 'command' && actionLike.type !== 'key' && actionLike.type !== 'text' && actionLike.type !== 'noop') {
 +			return undefined;
 +		}
@@ -546,6 +882,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			return undefined;
 +		}
 +		if (actionLike.type === 'key' && typeof actionLike.key !== 'string') {
++			return undefined;
++		}
++		if (actionLike.code !== undefined && typeof actionLike.code !== 'string') {
 +			return undefined;
 +		}
 +		if (actionLike.type === 'text' && typeof actionLike.text !== 'string') {
@@ -568,6 +907,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			type: actionLike.type,
 +			command: typeof actionLike.command === 'string' ? actionLike.command : undefined,
 +			key: typeof actionLike.key === 'string' ? actionLike.key : undefined,
++			code: typeof actionLike.code === 'string' ? actionLike.code : undefined,
 +			text: typeof actionLike.text === 'string' ? actionLike.text : undefined,
 +			ctrl: typeof actionLike.ctrl === 'boolean' ? actionLike.ctrl : undefined,
 +			alt: typeof actionLike.alt === 'boolean' ? actionLike.alt : undefined,
@@ -598,17 +938,44 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			if (!action.text) {
 +				return false;
 +			}
-+			return this.insertText(action.text);
++			const didInsert = this.insertText(action.text);
++			if (didInsert) {
++				this.consumeLatchedModifiers();
++			}
++			return didInsert;
 +		}
 +
 +		if (action.type === 'key') {
 +			if (!action.key) {
 +				return false;
 +			}
-+			return this.dispatchSyntheticKey(action);
++			const modifiers = this.getActiveModifierFlags(action);
++			const isPrintableCharacter = action.key.length === 1;
++			if (isPrintableCharacter && !modifiers.ctrl && !modifiers.alt && !modifiers.meta) {
++				const text = modifiers.shift ? action.key.toLocaleUpperCase() : action.key;
++				const didType = await this.typeText(text);
++				if (didType) {
++					this.consumeLatchedModifiers();
++				}
++				return didType;
++			}
++			const didDispatch = this.dispatchSyntheticKey(action);
++			if (didDispatch) {
++				this.consumeLatchedModifiers();
++			}
++			return didDispatch;
 +		}
 +
 +		return false;
++	}
++
++	private async typeText(text: string): Promise<boolean> {
++		try {
++			await this.commandService.executeCommand('type', { text });
++			return true;
++		} catch {
++			return this.insertText(text);
++		}
 +	}
 +
 +	private insertText(text: string): boolean {
@@ -633,14 +1000,15 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		const activeElement = document.activeElement;
 +		const target = activeElement instanceof HTMLElement ? activeElement : document.body;
 +		const key = action.key!;
++		const modifiers = this.getActiveModifierFlags(action);
 +
 +		const eventInit: KeyboardEventInit = {
 +			key,
-+			code: this.toKeyboardCode(key),
-+			ctrlKey: action.ctrl === true,
-+			altKey: action.alt === true,
-+			shiftKey: action.shift === true,
-+			metaKey: action.meta === true,
++			code: action.code ?? this.toKeyboardCode(key),
++			ctrlKey: modifiers.ctrl,
++			altKey: modifiers.alt,
++			shiftKey: modifiers.shift,
++			metaKey: modifiers.meta,
 +			bubbles: true,
 +			cancelable: true,
 +		};
@@ -663,7 +1031,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -285,10 +768,9 @@ export class CodeServerClient extends Di
+@@ -285,10 +1132,9 @@ export class CodeServerClient extends Di
  		handle.classList.toggle('cs-dermux-keybar-handle-hidden', this.keybarVisible);
  
  		if (this.keybarVisible) {
@@ -676,7 +1044,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +781,42 @@ export class CodeServerClient extends Di
+@@ -299,7 +1145,42 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -746,7 +1114,27 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	display: flex;
  	flex-direction: column;
  	gap: 6px;
-@@ -65,7 +61,7 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -34,7 +30,6 @@ body.cs-dermux-keybar-enabled .monaco-wo
+ 
+ .cs-dermux-keybar-row {
+ 	display: grid;
+-	grid-template-columns: repeat(6, minmax(0, 1fr));
+ 	gap: 6px;
+ }
+ 
+@@ -62,10 +57,19 @@ body.cs-dermux-keybar-enabled .monaco-wo
+ 	border-color: var(--vscode-charts-yellow);
+ }
+ 
++.cs-dermux-keybar-btn.cs-dermux-keybar-btn-active {
++	border-color: var(--vscode-button-background);
++	background: color-mix(in srgb, var(--vscode-button-background) 35%, var(--vscode-button-secondaryBackground));
++}
++
++.cs-dermux-keybar-btn.cs-dermux-keybar-btn-locked {
++	box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
++}
++
  .cs-dermux-keybar-handle {
  	position: fixed;
  	right: 10px;
@@ -755,3 +1143,70 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	height: 32px;
  	padding: 0 10px;
  	border: 1px solid var(--vscode-widget-border);
+Index: code-server/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
++++ code-server/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
+@@ -235,6 +235,7 @@ export class NativeEditContext extends A
+ 		}));
+ 		let reenableTracking: boolean = false;
+ 		this._register(IME.onDidChange(() => {
++			this._updateNativeImeAttributes();
+ 			if (IME.enabled && reenableTracking) {
+ 				this._focusTracker.resume();
+ 				this.domNode.focus();
+@@ -246,6 +247,7 @@ export class NativeEditContext extends A
+ 				reenableTracking = true;
+ 			}
+ 		}));
++		this._updateNativeImeAttributes();
+ 		this._register(NativeEditContextRegistry.register(ownerID, this));
+ 	}
+ 
+@@ -405,6 +407,22 @@ export class NativeEditContext extends A
+ 	private _updateDomAttributes(): void {
+ 		const options = this._context.configuration.options;
+ 		this.domNode.domNode.setAttribute('tabindex', String(options.get(EditorOption.tabIndex)));
++		this._updateNativeImeAttributes();
++	}
++
++	private _updateNativeImeAttributes(): void {
++		if (IME.enabled) {
++			this.domNode.removeAttribute('inputmode');
++			this.domNode.removeAttribute('virtualkeyboardpolicy');
++			this._imeTextArea.removeAttribute('inputmode');
++			this._imeTextArea.removeAttribute('virtualkeyboardpolicy');
++			return;
++		}
++
++		this.domNode.setAttribute('inputmode', 'none');
++		this.domNode.setAttribute('virtualkeyboardpolicy', 'manual');
++		this._imeTextArea.setAttribute('inputmode', 'none');
++		this._imeTextArea.setAttribute('virtualkeyboardpolicy', 'manual');
+ 	}
+ 
+ 	private _updateEditContext(): void {
+Index: code-server/lib/vscode/src/vs/editor/browser/controller/editContext/textArea/textAreaEditContext.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/editor/browser/controller/editContext/textArea/textAreaEditContext.ts
++++ code-server/lib/vscode/src/vs/editor/browser/controller/editContext/textArea/textAreaEditContext.ts
+@@ -666,13 +666,17 @@ export class TextAreaEditContext extends
+ 
+ 	private _ensureReadOnlyAttribute(): void {
+ 		const options = this._context.configuration.options;
+-		// When someone requests to disable IME, we set the "readonly" attribute on the <textarea>.
+-		// This will prevent composition.
++		// When IME is disabled, force the textarea into a mode where browsers should not summon
++		// the virtual keyboard and should not start composition.
+ 		const useReadOnly = !IME.enabled || (options.get(EditorOption.domReadOnly) && options.get(EditorOption.readOnly));
+ 		if (useReadOnly) {
+ 			this.textArea.setAttribute('readonly', 'true');
++			this.textArea.setAttribute('inputmode', 'none');
++			this.textArea.setAttribute('virtualkeyboardpolicy', 'manual');
+ 		} else {
+ 			this.textArea.removeAttribute('readonly');
++			this.textArea.removeAttribute('inputmode');
++			this.textArea.removeAttribute('virtualkeyboardpolicy');
+ 		}
+ 	}
+ 
