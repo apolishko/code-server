@@ -187,7 +187,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
 -	private addKeybarToggleCommand(): void {
 +	private initializeNativeImeControl(): void {
-+		if (!isMobile && !isAndroid) {
++		if (!this.isDermuxTouchSession()) {
 +			this.nativeImeEnabled = true;
 +			this.applyNativeImeMode(false);
 +			return;
@@ -346,11 +346,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
  	private createBottomKeybarSkeleton(): void {
 -		if (!isMobile) {
-+		if (!isMobile && !isAndroid) {
++		if (!this.isDermuxTouchSession()) {
  			return;
  		}
  
-@@ -218,13 +449,15 @@ export class CodeServerClient extends Di
+@@ -218,20 +449,25 @@ export class CodeServerClient extends Di
  
  		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
  		this.keybarVisible = storedVisibility ?? true;
@@ -369,7 +369,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
  		const handle = document.createElement('button');
  		handle.type = 'button';
-@@ -239,6 +472,7 @@ export class CodeServerClient extends Di
+ 		handle.className = 'cs-dermux-keybar-handle';
+-		handle.textContent = 'Keyboard';
++		handle.textContent = this.keybarVisible ? 'Hide KB' : 'Show KB';
++		handle.addEventListener('pointerdown', event => {
++			event.preventDefault();
++		});
+ 		handle.addEventListener('click', () => {
+-			this.keybarVisible = true;
++			this.keybarVisible = !this.keybarVisible;
+ 			this.setKeybarVisibility();
+ 		});
+ 
+@@ -239,6 +475,7 @@ export class CodeServerClient extends Di
  		body.append(keybar, handle);
  
  		this.keybarContainer = keybar;
@@ -377,7 +389,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +481,646 @@ export class CodeServerClient extends Di
+@@ -247,33 +484,749 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -950,8 +962,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				return false;
 +			}
 +			const modifiers = this.getActiveModifierFlags(action);
++			const activeEditable = this.getActiveEditableElement();
++			const hasHardModifiers = modifiers.ctrl || modifiers.alt || modifiers.meta;
++			if (activeEditable && this.shouldUseDomInsertion(activeEditable) && !hasHardModifiers) {
++				const didHandleEditingKey = this.applyEditingKeyToEditable(action.key, activeEditable);
++				if (didHandleEditingKey) {
++					this.consumeLatchedModifiers();
++					return true;
++				}
++			}
 +			const isPrintableCharacter = action.key.length === 1;
-+			if (isPrintableCharacter && !modifiers.ctrl && !modifiers.alt && !modifiers.meta) {
++			if (isPrintableCharacter && !hasHardModifiers) {
 +				const text = modifiers.shift ? action.key.toLocaleUpperCase() : action.key;
 +				const didType = await this.typeText(text);
 +				if (didType) {
@@ -969,7 +990,60 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return false;
 +	}
 +
++	private applyEditingKeyToEditable(key: string, target: HTMLElement): boolean {
++		if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
++			return false;
++		}
++		if (target.readOnly || target.disabled) {
++			return false;
++		}
++
++		try {
++			const valueLength = target.value.length;
++			const selectionStart = target.selectionStart ?? valueLength;
++			const selectionEnd = target.selectionEnd ?? valueLength;
++
++			if (key === 'Backspace') {
++				if (selectionStart === selectionEnd) {
++					if (selectionStart === 0) {
++						return true;
++					}
++					target.setRangeText('', selectionStart - 1, selectionEnd, 'end');
++				} else {
++					target.setRangeText('', selectionStart, selectionEnd, 'end');
++				}
++				target.dispatchEvent(new Event('input', { bubbles: true }));
++				return true;
++			}
++
++			if (key === 'Delete') {
++				if (selectionStart === selectionEnd) {
++					if (selectionEnd >= valueLength) {
++						return true;
++					}
++					target.setRangeText('', selectionStart, selectionEnd + 1, 'end');
++				} else {
++					target.setRangeText('', selectionStart, selectionEnd, 'end');
++				}
++				target.dispatchEvent(new Event('input', { bubbles: true }));
++				return true;
++			}
++		} catch {
++			return false;
++		}
++
++		return false;
++	}
++
 +	private async typeText(text: string): Promise<boolean> {
++		const activeEditable = this.getActiveEditableElement();
++		if (activeEditable && this.shouldUseDomInsertion(activeEditable)) {
++			const didInsert = this.insertText(text, activeEditable);
++			if (didInsert) {
++				return true;
++			}
++		}
++
 +		try {
 +			await this.commandService.executeCommand('type', { text });
 +			return true;
@@ -978,19 +1052,60 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +	}
 +
-+	private insertText(text: string): boolean {
++	private getActiveEditableElement(): HTMLElement | undefined {
 +		const activeElement = document.activeElement;
++		if (!(activeElement instanceof HTMLElement)) {
++			return undefined;
++		}
 +
-+		if (activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement) {
-+			const start = activeElement.selectionStart ?? activeElement.value.length;
-+			const end = activeElement.selectionEnd ?? activeElement.value.length;
-+			activeElement.setRangeText(text, start, end, 'end');
-+			activeElement.dispatchEvent(new Event('input', { bubbles: true }));
++		if (activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement || activeElement.isContentEditable) {
++			return activeElement;
++		}
++
++		return undefined;
++	}
++
++	private shouldUseDomInsertion(element: HTMLElement): boolean {
++		if (element.classList.contains('inputarea') || element.classList.contains('ime-text-area') || element.classList.contains('native-edit-context')) {
++			return false;
++		}
++
++		const elementAriaRoleDescription = element.getAttribute('aria-roledescription');
++		if (elementAriaRoleDescription === 'editor') {
++			return false;
++		}
++
++		return true;
++	}
++
++	private insertText(text: string, targetElement?: HTMLElement): boolean {
++		const target = targetElement ?? this.getActiveEditableElement();
++		if (!target) {
++			return false;
++		}
++
++		if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
++			if (target.readOnly || target.disabled) {
++				return false;
++			}
++			try {
++				const start = target.selectionStart ?? target.value.length;
++				const end = target.selectionEnd ?? target.value.length;
++				target.setRangeText(text, start, end, 'end');
++				target.dispatchEvent(new Event('input', { bubbles: true }));
++			} catch {
++				return false;
++			}
 +			return true;
 +		}
 +
-+		if (activeElement instanceof HTMLElement && activeElement.isContentEditable) {
-+			return document.execCommand('insertText', false, text);
++		if (target.isContentEditable) {
++			try {
++				target.focus({ preventScroll: true });
++				return document.execCommand('insertText', false, text);
++			} catch {
++				return false;
++			}
 +		}
 +
 +		return false;
@@ -1031,8 +1146,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -285,10 +1132,9 @@ export class CodeServerClient extends Di
- 		handle.classList.toggle('cs-dermux-keybar-handle-hidden', this.keybarVisible);
+@@ -282,13 +1235,12 @@ export class CodeServerClient extends Di
+ 		}
+ 
+ 		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
+-		handle.classList.toggle('cs-dermux-keybar-handle-hidden', this.keybarVisible);
++		handle.textContent = this.keybarVisible ? 'Hide KB' : 'Show KB';
  
  		if (this.keybarVisible) {
 -			const keybarHeight = `${Math.ceil(keybar.getBoundingClientRect().height)}px`;
@@ -1044,7 +1163,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1145,42 @@ export class CodeServerClient extends Di
+@@ -299,7 +1251,57 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1087,6 +1206,21 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private clearKeyboardOverlapInset(): void {
 +		this.keyboardOverlapPx = 0;
 +		document.documentElement.style.setProperty('--cs-dermux-keyboard-overlap', '0px');
++	}
++
++	private isDermuxTouchSession(): boolean {
++		const nav = navigator as Navigator & { userAgentData?: { mobile?: boolean } };
++		const ua = nav.userAgent ?? '';
++		const uaSaysAndroid = /Android/i.test(ua);
++		const uaDataSaysMobile = nav.userAgentData?.mobile === true;
++		const touchPoints = nav.maxTouchPoints ?? 0;
++		const hasCoarsePointer = typeof window.matchMedia === 'function'
++			? window.matchMedia('(pointer: coarse)').matches || window.matchMedia('(any-pointer: coarse)').matches
++			: false;
++		const smallestViewportPx = Math.min(window.innerWidth || 0, window.innerHeight || 0);
++		const mobileSizedViewport = smallestViewportPx > 0 && smallestViewportPx <= 1024;
++
++		return isAndroid || isMobile || uaSaysAndroid || uaDataSaysMobile || (touchPoints > 0 && hasCoarsePointer && mobileSizedViewport);
  	}
  }
 Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
@@ -1122,27 +1256,46 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	gap: 6px;
  }
  
-@@ -62,10 +57,19 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -62,21 +57,28 @@ body.cs-dermux-keybar-enabled .monaco-wo
  	border-color: var(--vscode-charts-yellow);
  }
  
 +.cs-dermux-keybar-btn.cs-dermux-keybar-btn-active {
-+	border-color: var(--vscode-button-background);
-+	background: color-mix(in srgb, var(--vscode-button-background) 35%, var(--vscode-button-secondaryBackground));
++	border-color: color-mix(in srgb, #c4c4c4 70%, var(--vscode-focusBorder));
++	background: color-mix(in srgb, #d8d8d8 78%, var(--vscode-button-secondaryBackground));
++	color: color-mix(in srgb, #101010 75%, var(--vscode-button-secondaryForeground));
 +}
 +
 +.cs-dermux-keybar-btn.cs-dermux-keybar-btn-locked {
++	background: color-mix(in srgb, #ececec 85%, var(--vscode-button-secondaryBackground));
 +	box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
 +}
 +
  .cs-dermux-keybar-handle {
  	position: fixed;
- 	right: 10px;
+-	right: 10px;
 -	bottom: calc(10px + var(--cs-dermux-safe-area-bottom));
-+	bottom: calc(10px + var(--cs-dermux-safe-area-bottom) + var(--cs-dermux-keyboard-overlap));
- 	height: 32px;
- 	padding: 0 10px;
+-	height: 32px;
+-	padding: 0 10px;
++	left: 10px;
++	bottom: calc(10px + var(--cs-dermux-safe-area-bottom) + var(--cs-dermux-keyboard-overlap) + var(--cs-dermux-keybar-height));
++	height: 36px;
++	padding: 0 12px;
  	border: 1px solid var(--vscode-widget-border);
+-	border-radius: 16px;
++	border-radius: 18px;
+ 	background: var(--vscode-button-background);
+ 	color: var(--vscode-button-foreground);
+-	font-size: 11px;
++	font-size: 12px;
+ 	font-weight: 600;
+-	z-index: 1701;
+-}
+-
+-.cs-dermux-keybar-handle.cs-dermux-keybar-handle-hidden {
+-	display: none;
++	z-index: 2147483000;
+ }
 Index: code-server/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
