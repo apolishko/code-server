@@ -51,10 +51,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
-@@ -1,28 +1,92 @@
+@@ -1,28 +1,97 @@
 -import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
+-import { isMobile } from '../../base/common/platform.js';
 +import { Disposable, DisposableStore, toDisposable } from "../../base/common/lifecycle.js";
- import { isMobile } from '../../base/common/platform.js';
++import { isAndroid, isMobile } from '../../base/common/platform.js';
 +import { joinPath } from '../../base/common/resources.js';
  import { localize } from '../../nls.js';
  import { MenuId, MenuRegistry } from '../../platform/actions/common/actions.js';
@@ -66,7 +67,6 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  import { IProductService } from '../../platform/product/common/productService.js';
  import { IStorageService, StorageScope, StorageTarget } from '../../platform/storage/common/storage.js';
 +import { IWorkspaceContextService } from '../../platform/workspace/common/workspace.js';
-+import * as Hjson from 'hjson';
  import './media/codeServerKeybar.css';
  
 +type KeybarActionType = 'command' | 'key' | 'text' | 'noop';
@@ -95,29 +95,32 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	readonly rows: [IKeybarButtonConfig[], IKeybarButtonConfig[]];
 +}
 +
-+const DEFAULT_KEYBAR_CONFIG_HJSON = `
-+{
-+  version: 1
-+  rows: [
-+    [
-+      { id: "esc", label: "Esc", tap: { type: "command", command: "workbench.action.closeQuickOpen" }, up: { type: "command", command: "workbench.action.showCommands" } }
-+      { id: "tab", label: "Tab", tap: { type: "key", key: "Tab" }, up: { type: "command", command: "workbench.action.quickOpen" } }
-+      { id: "ctrl", label: "Ctrl", tap: { type: "noop" } }
-+      { id: "alt", label: "Alt", tap: { type: "noop" } }
-+      { id: "shift", label: "Shift", tap: { type: "noop" } }
-+      { id: "find", label: "Find", tap: { type: "command", command: "actions.find" }, down: { type: "command", command: "editor.action.startFindReplaceAction" } }
-+    ]
-+    [
-+      { id: "palette", label: "Palette", tap: { type: "command", command: "workbench.action.showCommands" }, down: { type: "command", command: "workbench.action.quickOpen" } }
-+      { id: "open", label: "Open", tap: { type: "command", command: "workbench.action.quickOpen" } }
-+      { id: "save", label: "Save", tap: { type: "command", command: "workbench.action.files.save" } }
-+      { id: "line", label: "GoLine", tap: { type: "command", command: "workbench.action.gotoLine" } }
-+      { id: "close", label: "Close", tap: { type: "command", command: "workbench.action.closeActiveEditor" } }
-+      { id: "toggle", label: "Toggle", tap: { type: "command", command: "dermux.keybar.toggleVisibility" } }
-+    ]
-+  ]
++interface IHjsonModule {
++	parse(text: string, options?: unknown): unknown;
++	stringify(value: unknown, options?: unknown): string;
 +}
-+`;
++
++const DEFAULT_KEYBAR_CONFIG: IKeybarConfigModel = {
++	version: 1,
++	rows: [
++		[
++			{ id: "esc", label: "Esc", tap: { type: "command", command: "workbench.action.closeQuickOpen" }, up: { type: "command", command: "workbench.action.showCommands" } },
++			{ id: "tab", label: "Tab", tap: { type: "key", key: "Tab" }, up: { type: "command", command: "workbench.action.quickOpen" } },
++			{ id: "ctrl", label: "Ctrl", tap: { type: "noop" } },
++			{ id: "alt", label: "Alt", tap: { type: "noop" } },
++			{ id: "shift", label: "Shift", tap: { type: "noop" } },
++			{ id: "find", label: "Find", tap: { type: "command", command: "actions.find" }, down: { type: "command", command: "editor.action.startFindReplaceAction" } },
++		],
++		[
++			{ id: "palette", label: "Palette", tap: { type: "command", command: "workbench.action.showCommands" }, down: { type: "command", command: "workbench.action.quickOpen" } },
++			{ id: "open", label: "Open", tap: { type: "command", command: "workbench.action.quickOpen" } },
++			{ id: "save", label: "Save", tap: { type: "command", command: "workbench.action.files.save" } },
++			{ id: "line", label: "GoLine", tap: { type: "command", command: "workbench.action.gotoLine" } },
++			{ id: "close", label: "Close", tap: { type: "command", command: "workbench.action.closeActiveEditor" } },
++			{ id: "toggle", label: "Toggle", tap: { type: "command", command: "dermux.keybar.toggleVisibility" } },
++		],
++	],
++};
 +
  export class CodeServerClient extends Disposable {
  	static LOGOUT_COMMAND_ID = 'code-server.logout';
@@ -133,7 +136,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private keybarRowsContainer: HTMLElement | undefined;
  	private keybarHandle: HTMLElement | undefined;
  	private keybarVisible = true;
++	private keyboardOverlapPx = 0;
++	private keybarHeightPx = 0;
 +	private readonly keybarConfigWatchStore = this._register(new DisposableStore());
++	private hjsonModulePromise: Promise<IHjsonModule | undefined> | undefined;
  
  	constructor (
  		@ILogService private logService: ILogService,
@@ -146,7 +152,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	) {
  		super();
  	}
-@@ -102,7 +166,7 @@ export class CodeServerClient extends Di
+@@ -102,7 +171,7 @@ export class CodeServerClient extends Di
  			await this.registerServiceWorker(this.productService.serviceWorker);
  		}
  
@@ -155,7 +161,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.createBottomKeybarSkeleton();
  	}
  
-@@ -190,20 +254,32 @@ export class CodeServerClient extends Di
+@@ -190,24 +259,36 @@ export class CodeServerClient extends Di
  		}
  	}
  
@@ -189,7 +195,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	}
  
  	private createBottomKeybarSkeleton(): void {
-@@ -222,9 +298,9 @@ export class CodeServerClient extends Di
+-		if (!isMobile) {
++		if (!isMobile && !isAndroid) {
+ 			return;
+ 		}
+ 
+@@ -222,9 +303,9 @@ export class CodeServerClient extends Di
  		const keybar = document.createElement('div');
  		keybar.className = 'cs-dermux-keybar';
  
@@ -202,7 +213,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
  		const handle = document.createElement('button');
  		handle.type = 'button';
-@@ -239,6 +315,7 @@ export class CodeServerClient extends Di
+@@ -239,6 +320,7 @@ export class CodeServerClient extends Di
  		body.append(keybar, handle);
  
  		this.keybarContainer = keybar;
@@ -210,25 +221,33 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +324,392 @@ export class CodeServerClient extends Di
+@@ -247,33 +329,434 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
-+		const viewportResizeListener = () => this.setKeybarVisibility();
-+		window.addEventListener('resize', viewportResizeListener);
-+		window.visualViewport?.addEventListener('resize', viewportResizeListener);
++		const viewportListener = () => {
++			this.updateKeyboardOverlapInset();
++			this.setKeybarVisibility();
++		};
++		window.addEventListener('resize', viewportListener);
++		window.visualViewport?.addEventListener('resize', viewportListener);
++		window.visualViewport?.addEventListener('scroll', viewportListener);
 +		this._register(toDisposable(() => {
-+			window.removeEventListener('resize', viewportResizeListener);
-+			window.visualViewport?.removeEventListener('resize', viewportResizeListener);
++			window.removeEventListener('resize', viewportListener);
++			window.visualViewport?.removeEventListener('resize', viewportListener);
++			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +		}));
  		this._register(toDisposable(() => {
- 			this.clearKeybarInset();
+-			this.clearKeybarInset();
++			this.clearKeybarHeight();
++			this.clearKeyboardOverlapInset();
  			handle.remove();
  			keybar.remove();
  		}));
  
 +		this.watchWorkspaceKeybarConfig();
 +		void this.reloadKeybarConfig(false);
++		this.updateKeyboardOverlapInset();
  		this.setKeybarVisibility();
  	}
  
@@ -344,11 +363,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private async readKeybarConfig(): Promise<IKeybarConfigModel | undefined> {
 +		const workspaceRaw = await this.readWorkspaceKeybarConfigRaw();
 +		const configuredRaw = this.storageService.get(CodeServerClient.KEYBAR_CONFIG_STORAGE_KEY, StorageScope.APPLICATION);
-+		const source = workspaceRaw?.trim() || configuredRaw?.trim() || DEFAULT_KEYBAR_CONFIG_HJSON;
++		const source = workspaceRaw?.trim() || configuredRaw?.trim();
++		if (!source) {
++			return DEFAULT_KEYBAR_CONFIG;
++		}
 +
-+		const parsedConfig = this.parseAndValidateKeybarConfig(source);
++		const parsedConfig = await this.parseAndValidateKeybarConfig(source);
 +		if (parsedConfig) {
 +			return parsedConfig;
++		}
++
++		// Corrupted app-level cache should not poison startup forever.
++		if (!workspaceRaw && configuredRaw?.trim()) {
++			this.storageService.remove(CodeServerClient.KEYBAR_CONFIG_STORAGE_KEY, StorageScope.APPLICATION);
 +		}
 +
 +		this.notificationService.notify({
@@ -356,7 +383,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			message: localize('dermux.invalidKeybarConfig', "Invalid Dermux keybar config. Falling back to default."),
 +		});
 +
-+		return this.parseAndValidateKeybarConfig(DEFAULT_KEYBAR_CONFIG_HJSON);
++		return DEFAULT_KEYBAR_CONFIG;
 +	}
 +
 +	private watchWorkspaceKeybarConfig(): void {
@@ -402,9 +429,36 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return joinPath(firstFolder.uri, CodeServerClient.KEYBAR_WORKSPACE_CONFIG_RELATIVE_PATH);
 +	}
 +
-+	private parseAndValidateKeybarConfig(rawHjson: string): IKeybarConfigModel | undefined {
++	private async loadHjsonModule(): Promise<IHjsonModule | undefined> {
++		if (!this.hjsonModulePromise) {
++			this.hjsonModulePromise = (async () => {
++				try {
++					const moduleUrl = new URL('../../../../node_modules/hjson/bundle/hjson.js', import.meta.url).toString();
++					await eval(`import("${moduleUrl}")`);
++					const hjson = (globalThis as { Hjson?: IHjsonModule }).Hjson;
++					if (!hjson || typeof hjson.parse !== 'function' || typeof hjson.stringify !== 'function') {
++						this.logService.warn('[Dermux Keybar] HJSON bundle loaded but global Hjson parser is unavailable');
++						return undefined;
++					}
++					return hjson;
++				} catch (error) {
++					this.logService.warn(`[Dermux Keybar] failed to load HJSON parser: ${String(error)}`);
++					return undefined;
++				}
++			})();
++		}
++
++		return this.hjsonModulePromise;
++	}
++
++	private async parseAndValidateKeybarConfig(rawHjson: string): Promise<IKeybarConfigModel | undefined> {
++		const hjson = await this.loadHjsonModule();
++		if (!hjson) {
++			return undefined;
++		}
++
 +		try {
-+			const parsed = Hjson.parse(rawHjson);
++			const parsed = hjson.parse(rawHjson);
 +			return this.toKeybarConfigModel(parsed);
 +		} catch (error) {
 +			this.logService.warn(`[Dermux Keybar] failed to parse config: ${String(error)}`);
@@ -609,3 +663,95 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
+@@ -285,10 +768,9 @@ export class CodeServerClient extends Di
+ 		handle.classList.toggle('cs-dermux-keybar-handle-hidden', this.keybarVisible);
+ 
+ 		if (this.keybarVisible) {
+-			const keybarHeight = `${Math.ceil(keybar.getBoundingClientRect().height)}px`;
+-			document.documentElement.style.setProperty('--cs-dermux-keybar-height', keybarHeight);
++			this.setKeybarHeight(Math.ceil(keybar.getBoundingClientRect().height));
+ 		} else {
+-			this.clearKeybarInset();
++			this.clearKeybarHeight();
+ 		}
+ 
+ 		this.storageService.store(
+@@ -299,7 +781,42 @@ export class CodeServerClient extends Di
+ 		);
+ 	}
+ 
+-	private clearKeybarInset(): void {
+-		document.documentElement.style.setProperty('--cs-dermux-keybar-height', '0px');
++	private clearKeybarHeight(): void {
++		this.setKeybarHeight(0);
++	}
++
++	private setKeybarHeight(heightPx: number): void {
++		if (heightPx === this.keybarHeightPx) {
++			return;
++		}
++
++		this.keybarHeightPx = heightPx;
++		document.documentElement.style.setProperty('--cs-dermux-keybar-height', `${heightPx}px`);
++
++		// Prompt workbench layout recomputation when keybar visibility/size changes.
++		window.dispatchEvent(new Event('resize'));
++	}
++
++	private updateKeyboardOverlapInset(): void {
++		const visualViewport = window.visualViewport;
++		let overlapPx = 0;
++		if (visualViewport) {
++			const visualViewportBottom = visualViewport.height + visualViewport.offsetTop;
++			overlapPx = Math.max(0, Math.round(window.innerHeight - visualViewportBottom));
++		}
++		if (overlapPx === this.keyboardOverlapPx) {
++			return;
++		}
++
++		this.keyboardOverlapPx = overlapPx;
++		document.documentElement.style.setProperty('--cs-dermux-keyboard-overlap', `${overlapPx}px`);
++
++		// Prompt workbench layout recomputation when keyboard overlap changes.
++		window.dispatchEvent(new Event('resize'));
++	}
++
++	private clearKeyboardOverlapInset(): void {
++		this.keyboardOverlapPx = 0;
++		document.documentElement.style.setProperty('--cs-dermux-keyboard-overlap', '0px');
+ 	}
+ }
+Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
++++ code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
+@@ -1,18 +1,14 @@
+ :root {
+ 	--cs-dermux-keybar-height: 0px;
++	--cs-dermux-keyboard-overlap: 0px;
+ 	--cs-dermux-safe-area-bottom: env(safe-area-inset-bottom, 0px);
+ }
+ 
+-body.cs-dermux-keybar-enabled .monaco-workbench {
+-	padding-bottom: calc(var(--cs-dermux-keybar-height) + var(--cs-dermux-safe-area-bottom));
+-	box-sizing: border-box;
+-}
+-
+ .cs-dermux-keybar {
+ 	position: fixed;
+ 	left: 0;
+ 	right: 0;
+-	bottom: 0;
++	bottom: var(--cs-dermux-keyboard-overlap);
+ 	display: flex;
+ 	flex-direction: column;
+ 	gap: 6px;
+@@ -65,7 +61,7 @@ body.cs-dermux-keybar-enabled .monaco-wo
+ .cs-dermux-keybar-handle {
+ 	position: fixed;
+ 	right: 10px;
+-	bottom: calc(10px + var(--cs-dermux-safe-area-bottom));
++	bottom: calc(10px + var(--cs-dermux-safe-area-bottom) + var(--cs-dermux-keyboard-overlap));
+ 	height: 32px;
+ 	padding: 0 10px;
+ 	border: 1px solid var(--vscode-widget-border);

@@ -1,0 +1,18 @@
+Add HJSON module typings required by Dermux keybar config parser.
+
+Index: code-server/lib/vscode/src/typings/hjson.d.ts
+===================================================================
+--- /dev/null
++++ code-server/lib/vscode/src/typings/hjson.d.ts
+@@ -0,0 +1,12 @@
++declare module "hjson" {
++	export function parse(text: string, options?: unknown): any;
++	export function stringify(value: any, options?: unknown): string;
++
++	const Hjson: {
++		parse: typeof parse;
++		stringify: typeof stringify;
++	};
++
++	export default Hjson;
++}

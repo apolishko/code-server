@@ -24,3 +24,4 @@ trusted-domains.diff
 signature-verification.diff
 dermux-keybar.diff
 dermux-keybar-config.diff
+dermux-keybar-types.diff

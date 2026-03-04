@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from "child_process"
+import * as fs from "fs"
 import * as path from "path"
 import { onLine, OnLineCallback } from "../../src/node/util"
 
@@ -17,11 +18,18 @@ class Watcher {
     vscodeDir: path.join(this.rootPath, "lib/vscode"),
     pluginDir: process.env.PLUGIN_DIR,
   }
+  private readonly artifacts = {
+    codeServerEntry: path.join(this.rootPath, "out/node/entry.js"),
+    vscodeServerMain: path.join(this.rootPath, "lib/vscode/out/server-main.js"),
+  }
 
   //#region Web Server
 
   /** Development web server. */
   private webServer: ChildProcess | undefined
+  private webServerRestartTimer: NodeJS.Timeout | undefined
+  private lastWaitReason: string | undefined
+  private codeServerCompilerReady = false
 
   private reloadWebServer = (): void => {
     if (this.webServer) {
@@ -37,6 +45,45 @@ class Watcher {
     this.webServer.on("exit", () => console.log("[code-server]", `Web process ${pid} exited`))
 
     console.log("\n[code-server]", `Spawned web server process ${pid}`)
+  }
+
+  private getWebServerStartBlocker = (): string | undefined => {
+    if (!this.codeServerCompilerReady) {
+      return "code-server compiler output"
+    }
+
+    if (!fs.existsSync(this.artifacts.codeServerEntry)) {
+      return this.artifacts.codeServerEntry
+    }
+
+    if (!fs.existsSync(this.artifacts.vscodeServerMain)) {
+      return this.artifacts.vscodeServerMain
+    }
+
+    return undefined
+  }
+
+  private scheduleWebServerReload = (delayMs = 250): void => {
+    if (this.webServerRestartTimer) {
+      clearTimeout(this.webServerRestartTimer)
+    }
+
+    this.webServerRestartTimer = setTimeout(() => {
+      this.webServerRestartTimer = undefined
+
+      const blocker = this.getWebServerStartBlocker()
+      if (blocker) {
+        if (this.lastWaitReason !== blocker) {
+          console.log("[code-server]", `Waiting for ${blocker} before restarting web process`)
+        }
+        this.lastWaitReason = blocker
+        this.scheduleWebServerReload(1000)
+        return
+      }
+
+      this.lastWaitReason = undefined
+      this.reloadWebServer()
+    }, delayMs)
   }
 
   //#endregion
@@ -89,7 +136,7 @@ class Watcher {
 
     if (strippedLine.includes("Finished compilation with")) {
       console.log("[Code OSS] ✨ Finished compiling! ✨", "(Refresh your web browser ♻️)")
-      this.reloadWebServer()
+      this.scheduleWebServerReload()
     }
   }
 
@@ -99,8 +146,9 @@ class Watcher {
     console.log("[Compiler][code-server]", originalLine)
 
     if (strippedLine.includes("Watching for file changes")) {
+      this.codeServerCompilerReady = true
       console.log("[Compiler][code-server]", "Finished compiling!", "(Refresh your web browser ♻️)")
-      this.reloadWebServer()
+      this.scheduleWebServerReload()
     }
   }
 
@@ -110,7 +158,7 @@ class Watcher {
     console.log("[Compiler][Plugin]", originalLine)
 
     if (strippedLine.includes("Watching for file changes...")) {
-      this.reloadWebServer()
+      this.scheduleWebServerReload()
     }
   }
 
@@ -119,6 +167,11 @@ class Watcher {
   //#region Utilities
 
   private dispose(code: number | null): void {
+    if (this.webServerRestartTimer) {
+      clearTimeout(this.webServerRestartTimer)
+      this.webServerRestartTimer = undefined
+    }
+
     for (const [processName, devProcess] of Object.entries(this.compilers)) {
       console.log(`[${processName}]`, "Killing...\n")
       devProcess?.removeAllListeners()
