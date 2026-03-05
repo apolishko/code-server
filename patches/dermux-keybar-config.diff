@@ -389,7 +389,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +484,752 @@ export class CodeServerClient extends Di
+@@ -247,33 +484,764 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -400,13 +400,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +		}));
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -496,8 +496,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
 +				return;
 +			}
++			const shouldRestoreFocus = this.shouldRestoreFocusAfterAction(action);
 +			await this.dispatchKeybarAction(action);
-+			if (this.shouldRestoreFocusAfterAction(action)) {
++			if (shouldRestoreFocus) {
 +				this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
 +			}
 +		};
@@ -625,7 +626,18 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private shouldRestoreFocusAfterAction(action: IKeybarActionConfig): boolean {
 +		// Command actions can move focus intentionally (quick pick, palette, dialogs).
 +		// Do not force focus back after running them.
-+		return action.type !== 'command';
++		if (action.type === 'command') {
++			return false;
++		}
++
++		if (action.type === 'key') {
++			const modifiers = this.getActiveModifierFlags(action);
++			if (modifiers.ctrl || modifiers.alt || modifiers.meta) {
++				return false;
++			}
++		}
++
++		return true;
 +	}
 +
 +	private tryToggleModifierFromAction(buttonConfig: IKeybarButtonConfig, action: IKeybarActionConfig): boolean {
@@ -1149,7 +1161,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -282,13 +1238,12 @@ export class CodeServerClient extends Di
+@@ -282,13 +1250,12 @@ export class CodeServerClient extends Di
  		}
  
  		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
@@ -1166,7 +1178,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1254,57 @@ export class CodeServerClient extends Di
+@@ -299,7 +1266,57 @@ export class CodeServerClient extends Di
  		);
  	}
  
