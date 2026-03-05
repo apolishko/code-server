@@ -1,11 +1,11 @@
-Extend Dermux keybar with HJSON config, gestures and runtime reload.
+Extend Dermux keybar with touch-first keyboard behavior and hardcoded layout rendering.
 
 This patch introduces:
-1. `hjson` dependency for strict config parsing.
-2. Config model validation and rendering from two-row layout.
-3. Tap/up/down gesture routing with swipe thresholds.
-4. Runtime config reload command and workspace file watch (`.dermux-keybar.hjson`).
-5. Action dispatch (`command|key|text|noop`).
+1. Android-friendly keybar lifecycle, visibility, and IME controls.
+2. Sticky modifiers with explicit visual states.
+3. Hardcoded EN/RU/Fn/Caps keyboard rows with variable-width keys.
+4. Pointer gesture routing with swipe support for key actions.
+5. Focus-safe command/key dispatch for browser editor workflows.
 
 Index: code-server/lib/vscode/package-lock.json
 ===================================================================
@@ -51,23 +51,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
-@@ -1,28 +1,117 @@
--import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
+@@ -1,28 +1,102 @@
+ import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
 -import { isMobile } from '../../base/common/platform.js';
-+import { Disposable, DisposableStore, toDisposable } from "../../base/common/lifecycle.js";
 +import { IME } from '../../base/common/ime.js';
 +import { isAndroid, isMobile } from '../../base/common/platform.js';
-+import { joinPath } from '../../base/common/resources.js';
  import { localize } from '../../nls.js';
  import { MenuId, MenuRegistry } from '../../platform/actions/common/actions.js';
 -import { CommandsRegistry } from '../../platform/commands/common/commands.js';
 +import { CommandsRegistry, ICommandService } from '../../platform/commands/common/commands.js';
-+import { FileOperationError, FileOperationResult, IFileService } from '../../platform/files/common/files.js';
  import { ILogService } from '../../platform/log/common/log.js';
  import { INotificationService, Severity } from '../../platform/notification/common/notification.js';
  import { IProductService } from '../../platform/product/common/productService.js';
  import { IStorageService, StorageScope, StorageTarget } from '../../platform/storage/common/storage.js';
-+import { IWorkspaceContextService } from '../../platform/workspace/common/workspace.js';
  import './media/codeServerKeybar.css';
  
 +type KeybarActionType = 'command' | 'key' | 'text' | 'noop';
@@ -87,59 +83,49 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +interface IKeybarButtonConfig {
 +	readonly id: string;
 +	readonly label: string;
++	readonly widthUnits?: number;
++	readonly secondaryLabel?: string;
 +	readonly tap: IKeybarActionConfig;
 +	readonly up?: IKeybarActionConfig;
 +	readonly down?: IKeybarActionConfig;
 +}
 +
-+interface IKeybarConfigModel {
-+	readonly version: 1;
-+	readonly rows: [IKeybarButtonConfig[], IKeybarButtonConfig[]];
++interface IKeybarCharacterVariant {
++	readonly label: string;
++	readonly key: string;
 +}
 +
-+interface IHjsonModule {
-+	parse(text: string, options?: unknown): unknown;
-+	stringify(value: unknown, options?: unknown): string;
++interface IKeybarShiftFnKeyConfig {
++	readonly id: string;
++	readonly widthUnits: number;
++	readonly normal: IKeybarCharacterVariant;
++	readonly shift?: IKeybarCharacterVariant;
++	readonly fn?: IKeybarCharacterVariant;
++}
++
++interface IKeybarLocalizedKeyConfig {
++	readonly id: string;
++	readonly widthUnits: number;
++	readonly en: IKeybarCharacterVariant;
++	readonly ru: IKeybarCharacterVariant;
++	readonly enShift?: IKeybarCharacterVariant;
++	readonly ruShift?: IKeybarCharacterVariant;
++	readonly fn?: IKeybarCharacterVariant;
 +}
 +
 +type KeybarModifier = 'ctrl' | 'alt' | 'shift' | 'meta';
 +type KeybarModifierState = 'off' | 'latched' | 'locked';
 +
-+const DEFAULT_KEYBAR_CONFIG: IKeybarConfigModel = {
-+	version: 1,
-+	rows: [
-+		[
-+			{ id: "esc", label: "Esc", tap: { type: "command", command: "workbench.action.closeQuickOpen" }, up: { type: "command", command: "workbench.action.showCommands" } },
-+			{ id: "tab", label: "Tab", tap: { type: "key", key: "Tab" }, up: { type: "command", command: "workbench.action.quickOpen" } },
-+			{ id: "ctrl", label: "Ctrl", tap: { type: "noop" } },
-+			{ id: "alt", label: "Alt", tap: { type: "noop" } },
-+			{ id: "shift", label: "Shift", tap: { type: "noop" } },
-+			{ id: "find", label: "Find", tap: { type: "command", command: "actions.find" }, down: { type: "command", command: "editor.action.startFindReplaceAction" } },
-+		],
-+		[
-+			{ id: "palette", label: "Palette", tap: { type: "command", command: "workbench.action.showCommands" }, down: { type: "command", command: "workbench.action.quickOpen" } },
-+			{ id: "open", label: "Open", tap: { type: "command", command: "workbench.action.quickOpen" } },
-+			{ id: "save", label: "Save", tap: { type: "command", command: "workbench.action.files.save" } },
-+			{ id: "line", label: "GoLine", tap: { type: "command", command: "workbench.action.gotoLine" } },
-+			{ id: "close", label: "Close", tap: { type: "command", command: "workbench.action.closeActiveEditor" } },
-+			{ id: "toggle", label: "Toggle", tap: { type: "command", command: "dermux.keybar.toggleVisibility" } },
-+		],
-+	],
-+};
-+
  export class CodeServerClient extends Disposable {
  	static LOGOUT_COMMAND_ID = 'code-server.logout';
 +	static DERMUX_NO_SW_QUERY_PARAM = 'dermux-nosw';
  	static KEYBAR_TOGGLE_COMMAND_ID = 'dermux.keybar.toggleVisibility';
-+	static KEYBAR_RELOAD_COMMAND_ID = 'dermux.keybar.reloadConfig';
 +	static KEYBAR_TOGGLE_LAYOUT_COMMAND_ID = 'dermux.keybar.toggleLayout';
 +	static KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID = 'dermux.keybar.toggleNativeIme';
  	static KEYBAR_VISIBLE_STORAGE_KEY = 'dermux.keybar.visible';
-+	static KEYBAR_CONFIG_STORAGE_KEY = 'dermux.keybar.config.hjson';
 +	static KEYBAR_LAYOUT_STORAGE_KEY = 'dermux.keybar.layout';
 +	static KEYBAR_NATIVE_IME_ENABLED_STORAGE_KEY = 'dermux.keybar.nativeIme.enabled';
 +	static KEYBAR_NATIVE_IME_MODE_ATTRIBUTE = 'data-cs-native-ime';
-+	static KEYBAR_WORKSPACE_CONFIG_RELATIVE_PATH = '.dermux-keybar.hjson';
 +	static KEYBAR_SWIPE_THRESHOLD_PX = 18;
 +	static KEYBAR_SWIPE_COMMIT_PX = 30;
  
@@ -150,16 +136,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private keyboardOverlapPx = 0;
 +	private keybarHeightPx = 0;
 +	private keybarLayout: 'en' | 'ru' = 'en';
++	private fnModeEnabled = false;
++	private capsLockEnabled = false;
 +	private nativeImeEnabled = false;
-+	private readonly modifierButtonByKind = new Map<KeybarModifier, HTMLButtonElement>();
++	private readonly modifierButtonByKind = new Map<KeybarModifier, Set<HTMLButtonElement>>();
 +	private readonly modifierState: Record<KeybarModifier, KeybarModifierState> = {
 +		ctrl: 'off',
 +		alt: 'off',
 +		shift: 'off',
 +		meta: 'off',
 +	};
-+	private readonly keybarConfigWatchStore = this._register(new DisposableStore());
-+	private hjsonModulePromise: Promise<IHjsonModule | undefined> | undefined;
  
  	constructor (
  		@ILogService private logService: ILogService,
@@ -167,12 +153,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		@IProductService private productService: IProductService,
  		@IStorageService private storageService: IStorageService,
 +		@ICommandService private commandService: ICommandService,
-+		@IFileService private fileService: IFileService,
-+		@IWorkspaceContextService private workspaceContextService: IWorkspaceContextService,
  	) {
  		super();
  	}
-@@ -99,10 +188,16 @@ export class CodeServerClient extends Di
+@@ -99,10 +173,16 @@ export class CodeServerClient extends Di
  		}
  
  		if (this.productService.serviceWorker) {
@@ -191,7 +175,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.createBottomKeybarSkeleton();
  	}
  
-@@ -190,24 +285,218 @@ export class CodeServerClient extends Di
+@@ -190,24 +270,210 @@ export class CodeServerClient extends Di
  		}
  	}
  
@@ -349,7 +333,6 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +	private addKeybarCommands(): void {
  		const toggleTitle = localize('dermux.toggleBottomKeybar', "Dermux: Toggle Bottom Keybar");
-+		const reloadTitle = localize('dermux.reloadBottomKeybar', "Dermux: Reload Bottom Keybar Config");
 +		const toggleLayoutTitle = localize('dermux.toggleBottomKeybarLayout', "Dermux: Toggle Bottom Keybar Layout");
 +		const toggleNativeImeTitle = localize('dermux.toggleNativeIme', "Dermux: Toggle Native Keyboard");
  
@@ -358,19 +341,8 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			this.setKeybarVisibility();
  		}));
  
-+		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_RELOAD_COMMAND_ID, () => {
-+			void this.reloadKeybarConfig(true);
-+		}));
-+
 +		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_LAYOUT_COMMAND_ID, () => {
-+			this.keybarLayout = this.keybarLayout === 'en' ? 'ru' : 'en';
-+			this.storageService.store(
-+				CodeServerClient.KEYBAR_LAYOUT_STORAGE_KEY,
-+				this.keybarLayout,
-+				StorageScope.APPLICATION,
-+				StorageTarget.USER,
-+			);
-+			void this.reloadKeybarConfig(false);
++			this.toggleKeybarLayout();
 +		}));
 +
 +		this._register(CommandsRegistry.registerCommand(CodeServerClient.KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID, () => {
@@ -386,13 +358,6 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
 +			command: {
-+				id: CodeServerClient.KEYBAR_RELOAD_COMMAND_ID,
-+				title: reloadTitle,
-+			},
-+		});
-+
-+		MenuRegistry.appendMenuItem(MenuId.CommandPalette, {
-+			command: {
 +				id: CodeServerClient.KEYBAR_TOGGLE_LAYOUT_COMMAND_ID,
 +				title: toggleLayoutTitle,
 +			},
@@ -404,6 +369,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				title: toggleNativeImeTitle,
 +			},
 +		});
++	}
++
++	private toggleKeybarLayout(): void {
++		this.keybarLayout = this.keybarLayout === 'en' ? 'ru' : 'en';
++		this.storageService.store(
++			CodeServerClient.KEYBAR_LAYOUT_STORAGE_KEY,
++			this.keybarLayout,
++			StorageScope.APPLICATION,
++			StorageTarget.USER,
++		);
++		void this.reloadKeybarConfig(false);
  	}
  
  	private createBottomKeybarSkeleton(): void {
@@ -412,7 +388,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			return;
  		}
  
-@@ -218,20 +507,25 @@ export class CodeServerClient extends Di
+@@ -215,30 +481,41 @@ export class CodeServerClient extends Di
+ 		if (!body) {
+ 			return;
+ 		}
++		const root = document.documentElement;
  
  		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
  		this.keybarVisible = storedVisibility ?? true;
@@ -421,10 +401,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
  		const keybar = document.createElement('div');
  		keybar.className = 'cs-dermux-keybar';
- 
+-
 -		const rowOne = this.createKeybarRow(['Esc', 'Tab', 'Ctrl', 'Alt', 'Shift', 'Find']);
 -		const rowTwo = this.createKeybarRow(['Palette', 'Open', 'Save', 'GoLine', 'Close', 'Toggle']);
 -		keybar.append(rowOne, rowTwo);
++		this.enforceOpaqueElementStyles(keybar, '#000000');
++		keybar.style.setProperty('isolation', 'isolate', 'important');
++		keybar.style.setProperty('contain', 'paint', 'important');
++
 +		const rowsContainer = document.createElement('div');
 +		rowsContainer.className = 'cs-dermux-keybar-rows';
 +		keybar.append(rowsContainer);
@@ -433,6 +417,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		handle.type = 'button';
  		handle.className = 'cs-dermux-keybar-handle';
 -		handle.textContent = 'Keyboard';
++		this.enforceOpaqueElementStyles(handle);
 +		handle.textContent = this.keybarVisible ? 'Hide KB' : 'Show KB';
 +		handle.addEventListener('pointerdown', event => {
 +			event.preventDefault();
@@ -443,15 +428,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			this.setKeybarVisibility();
  		});
  
-@@ -239,6 +533,7 @@ export class CodeServerClient extends Di
- 		body.append(keybar, handle);
+ 		body.classList.add('cs-dermux-keybar-enabled');
+-		body.append(keybar, handle);
++		root.append(keybar, handle);
  
  		this.keybarContainer = keybar;
 +		this.keybarRowsContainer = rowsContainer;
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +542,764 @@ export class CodeServerClient extends Di
+@@ -247,33 +524,912 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -475,17 +461,26 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			keybar.remove();
  		}));
  
-+		this.watchWorkspaceKeybarConfig();
 +		void this.reloadKeybarConfig(false);
 +		this.updateKeyboardOverlapInset();
  		this.setKeybarVisibility();
++		setTimeout(() => this.applyWorkbenchBottomInset(), 0);
  	}
  
 -	private createKeybarRow(labels: string[]): HTMLDivElement {
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
-+		row.style.gridTemplateColumns = `repeat(${Math.max(1, buttons.length)}, minmax(0, 1fr))`;
++		const totalQuarterUnits = Math.max(
++			1,
++			Math.round(
++				buttons.reduce((sum, buttonConfig) => {
++					const widthUnits = buttonConfig.widthUnits ?? 1;
++					return sum + widthUnits;
++				}, 0) * 4,
++			),
++		);
++		row.style.gridTemplateColumns = `repeat(${totalQuarterUnits}, minmax(0, 1fr))`;
  
 -		for (const label of labels) {
 +		for (const buttonConfig of buttons) {
@@ -497,19 +492,59 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 -				this.logService.debug(`[Dermux Keybar] tapped "${label}"`);
 -			});
 +			button.tabIndex = -1;
-+			button.textContent = buttonConfig.label;
-+			this.bindButtonGesture(button, buttonConfig);
++			const widthUnits = Math.max(0.25, buttonConfig.widthUnits ?? 1);
++			button.style.gridColumn = `span ${Math.max(1, Math.round(widthUnits * 4))}`;
++			const label = document.createElement('span');
++			label.className = 'cs-dermux-keybar-btn-label';
++			label.textContent = buttonConfig.label;
++			button.append(label);
++			if (buttonConfig.secondaryLabel) {
++				const secondaryLabel = document.createElement('span');
++				secondaryLabel.className = 'cs-dermux-keybar-btn-secondary-label';
++				secondaryLabel.textContent = buttonConfig.secondaryLabel;
++				button.append(secondaryLabel);
++			}
++
++			if (this.isSpacerButton(buttonConfig)) {
++				button.classList.add('cs-dermux-keybar-btn-placeholder');
++			} else {
++				this.bindButtonGesture(button, buttonConfig);
++			}
++
 +			const modifierKind = this.toModifierKind(buttonConfig.id);
 +			if (modifierKind) {
-+				this.modifierButtonByKind.set(modifierKind, button);
++				let buttonsForModifier = this.modifierButtonByKind.get(modifierKind);
++				if (!buttonsForModifier) {
++					buttonsForModifier = new Set<HTMLButtonElement>();
++					this.modifierButtonByKind.set(modifierKind, buttonsForModifier);
++				}
++				buttonsForModifier.add(button);
++			}
++
++			if (this.isFnToggleButton(buttonConfig.id) && this.fnModeEnabled) {
++				button.classList.add('cs-dermux-keybar-btn-active');
++			}
++			if (this.isCapsToggleButton(buttonConfig.id) && this.capsLockEnabled) {
++				button.classList.add('cs-dermux-keybar-btn-active', 'cs-dermux-keybar-btn-locked');
 +			}
  			row.appendChild(button);
  		}
  
-+		this.renderModifierButtons();
  		return row;
  	}
  
++	private enforceOpaqueElementStyles(element: HTMLElement, backgroundColor?: string): void {
++		element.style.setProperty('opacity', '1', 'important');
++		element.style.setProperty('filter', 'none', 'important');
++		element.style.setProperty('backdrop-filter', 'none', 'important');
++		element.style.setProperty('-webkit-backdrop-filter', 'none', 'important');
++		element.style.setProperty('mix-blend-mode', 'normal', 'important');
++		if (backgroundColor) {
++			element.style.setProperty('background', backgroundColor, 'important');
++			element.style.setProperty('background-color', backgroundColor, 'important');
++		}
++	}
++
 +	private bindButtonGesture(button: HTMLButtonElement, buttonConfig: IKeybarButtonConfig): void {
 +		let startY = 0;
 +		let latestDeltaY = 0;
@@ -554,7 +589,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			button.releasePointerCapture(pointerId);
 +
 +			const action = this.resolveButtonAction(buttonConfig, latestDeltaY);
-+			if (this.tryToggleModifierFromAction(buttonConfig, action)) {
++			if (this.tryHandleToggleButton(buttonConfig, action)) {
 +				this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
 +				return;
 +			}
@@ -584,83 +619,438 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	}
 +
 +	private toModifierKind(buttonId: string): KeybarModifier | undefined {
-+		switch (buttonId.toLowerCase()) {
-+			case 'ctrl':
-+				return 'ctrl';
-+			case 'alt':
-+				return 'alt';
-+			case 'shift':
-+				return 'shift';
-+			case 'meta':
-+				return 'meta';
-+			default:
-+				return undefined;
++		const normalizedId = buttonId.toLowerCase();
++		if (normalizedId.includes('ctrl') || normalizedId.includes('control')) {
++			return 'ctrl';
 +		}
++		if (normalizedId.includes('alt')) {
++			return 'alt';
++		}
++		if (normalizedId.includes('shift')) {
++			return 'shift';
++		}
++		if (normalizedId.includes('meta') || normalizedId.includes('cmd') || normalizedId.includes('win')) {
++			return 'meta';
++		}
++		return undefined;
 +	}
 +
-+	private buildVirtualKeyboardRows(): IKeybarButtonConfig[][] {
-+		const createLetterKey = (code: string, enLetter: string, ruLetter: string): IKeybarButtonConfig => {
-+			const key = this.keybarLayout === 'ru' ? ruLetter : enLetter;
-+			return {
-+				id: `vk-${code.toLowerCase()}`,
-+				label: key,
-+				tap: { type: 'key', key, code },
-+			};
-+		};
++	private isFnToggleButton(buttonId: string): boolean {
++		return buttonId.toLowerCase() === 'fn';
++	}
 +
++	private isCapsToggleButton(buttonId: string): boolean {
++		return buttonId.toLowerCase() === 'capslock';
++	}
++
++	private isLanguageToggleButton(buttonId: string): boolean {
++		return buttonId.toLowerCase() === 'langswitch';
++	}
++
++	private isSpacerButton(buttonConfig: IKeybarButtonConfig): boolean {
++		return (
++			buttonConfig.label.length === 0 &&
++			buttonConfig.tap.type === 'noop' &&
++			buttonConfig.up === undefined &&
++			buttonConfig.down === undefined
++		);
++	}
++
++	private tryHandleToggleButton(buttonConfig: IKeybarButtonConfig, action: IKeybarActionConfig): boolean {
++		if (action.type !== 'noop') {
++			return false;
++		}
++
++		const modifierKind = this.toModifierKind(buttonConfig.id);
++		if (modifierKind) {
++			const currentState = this.modifierState[modifierKind];
++			let nextState: KeybarModifierState;
++			switch (currentState) {
++				case 'off':
++					nextState = 'latched';
++					break;
++				case 'latched':
++					nextState = 'locked';
++					break;
++				case 'locked':
++					nextState = 'off';
++					break;
++			}
++
++			this.modifierState[modifierKind] = nextState;
++			this.renderModifierButtons();
++			return true;
++		}
++
++		if (this.isFnToggleButton(buttonConfig.id)) {
++			this.fnModeEnabled = !this.fnModeEnabled;
++			void this.reloadKeybarConfig(false);
++			return true;
++		}
++
++		if (this.isCapsToggleButton(buttonConfig.id)) {
++			this.capsLockEnabled = !this.capsLockEnabled;
++			void this.reloadKeybarConfig(false);
++			return true;
++		}
++
++		if (this.isLanguageToggleButton(buttonConfig.id)) {
++			this.toggleKeybarLayout();
++			return true;
++		}
++
++		return false;
++	}
++
++	private buildHardcodedKeyboardRows(): IKeybarButtonConfig[][] {
 +		return [
 +			[
-+				createLetterKey('KeyQ', 'q', 'й'),
-+				createLetterKey('KeyW', 'w', 'ц'),
-+				createLetterKey('KeyE', 'e', 'у'),
-+				createLetterKey('KeyR', 'r', 'к'),
-+				createLetterKey('KeyT', 't', 'е'),
-+				createLetterKey('KeyY', 'y', 'н'),
-+				createLetterKey('KeyU', 'u', 'г'),
-+				createLetterKey('KeyI', 'i', 'ш'),
-+				createLetterKey('KeyO', 'o', 'щ'),
-+				createLetterKey('KeyP', 'p', 'з'),
++				this.createFixedKeyButton('Escape', 'Esc', 'Escape', 1),
++				this.createFixedKeyButton('F1', 'F1', 'F1', 1),
++				this.createFixedKeyButton('F2', 'F2', 'F2', 1),
++				this.createFixedKeyButton('F3', 'F3', 'F3', 1),
++				this.createFixedKeyButton('F4', 'F4', 'F4', 1),
++				this.createFixedKeyButton('F5', 'F5', 'F5', 1),
++				this.createFixedKeyButton('F6', 'F6', 'F6', 1),
++				this.createFixedKeyButton('F7', 'F7', 'F7', 1),
++				this.createFixedKeyButton('F8', 'F8', 'F8', 1),
++				this.createFixedKeyButton('F9', 'F9', 'F9', 1),
++				this.createFixedKeyButton('F10', 'F10', 'F10', 1),
++				this.createFixedKeyButton('F11', 'F11', 'F11', 1),
++				this.createFixedKeyButton('F12', 'F12', 'F12', 1),
++				this.createPlaceholderButton('User1', '[U1]', 1),
++				this.createFixedKeyButton('Insert', 'Ins', 'Insert', 1),
++				this.createFixedKeyButton('Delete', 'Del', 'Delete', 1),
 +			],
 +			[
-+				createLetterKey('KeyA', 'a', 'ф'),
-+				createLetterKey('KeyS', 's', 'ы'),
-+				createLetterKey('KeyD', 'd', 'в'),
-+				createLetterKey('KeyF', 'f', 'а'),
-+				createLetterKey('KeyG', 'g', 'п'),
-+				createLetterKey('KeyH', 'h', 'р'),
-+				createLetterKey('KeyJ', 'j', 'о'),
-+				createLetterKey('KeyK', 'k', 'л'),
-+				createLetterKey('KeyL', 'l', 'д'),
++				this.createShiftFnKeyButton({
++					id: 'Backquote',
++					widthUnits: 1,
++					normal: { label: '`', key: '`' },
++					shift: { label: '~', key: '~' },
++					fn: { label: '~', key: '~' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit1',
++					widthUnits: 1,
++					normal: { label: '1', key: '1' },
++					shift: { label: '!', key: '!' },
++					fn: { label: '!', key: '!' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit2',
++					widthUnits: 1,
++					normal: { label: '2', key: '2' },
++					shift: { label: '@', key: '@' },
++					fn: { label: '@', key: '@' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit3',
++					widthUnits: 1,
++					normal: { label: '3', key: '3' },
++					shift: { label: '#', key: '#' },
++					fn: { label: '#', key: '#' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit4',
++					widthUnits: 1,
++					normal: { label: '4', key: '4' },
++					shift: { label: '$', key: '$' },
++					fn: { label: '$', key: '$' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit5',
++					widthUnits: 1,
++					normal: { label: '5', key: '5' },
++					shift: { label: '%', key: '%' },
++					fn: { label: '%', key: '%' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit6',
++					widthUnits: 1,
++					normal: { label: '6', key: '6' },
++					shift: { label: '^', key: '^' },
++					fn: { label: '^', key: '^' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit7',
++					widthUnits: 1,
++					normal: { label: '7', key: '7' },
++					shift: { label: '&', key: '&' },
++					fn: { label: '&', key: '&' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit8',
++					widthUnits: 1,
++					normal: { label: '8', key: '8' },
++					shift: { label: '*', key: '*' },
++					fn: { label: '*', key: '*' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit9',
++					widthUnits: 1,
++					normal: { label: '9', key: '9' },
++					shift: { label: '(', key: '(' },
++					fn: { label: '(', key: '(' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Digit0',
++					widthUnits: 1,
++					normal: { label: '0', key: '0' },
++					shift: { label: ')', key: ')' },
++					fn: { label: ')', key: ')' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Minus',
++					widthUnits: 1,
++					normal: { label: '-', key: '-' },
++					shift: { label: '_', key: '_' },
++					fn: { label: '_', key: '_' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'Equal',
++					widthUnits: 1,
++					normal: { label: '=', key: '=' },
++					shift: { label: '+', key: '+' },
++					fn: { label: '+', key: '+' },
++				}),
++				this.createFixedKeyButton('Backspace', '⌫', 'Backspace', 2),
 +			],
 +			[
-+				createLetterKey('KeyZ', 'z', 'я'),
-+				createLetterKey('KeyX', 'x', 'ч'),
-+				createLetterKey('KeyC', 'c', 'с'),
-+				createLetterKey('KeyV', 'v', 'м'),
-+				createLetterKey('KeyB', 'b', 'и'),
-+				createLetterKey('KeyN', 'n', 'т'),
-+				createLetterKey('KeyM', 'm', 'ь'),
-+				{ id: 'vk-backspace', label: 'Bksp', tap: { type: 'key', key: 'Backspace', code: 'Backspace' } },
++				this.createFixedKeyButton('Tab', 'Tab', 'Tab', 1.5),
++				this.createLocalizedKeyButton({ id: 'KeyQ', widthUnits: 1, en: { label: 'Q', key: 'q' }, ru: { label: 'Й', key: 'й' } }),
++				this.createLocalizedKeyButton({ id: 'KeyW', widthUnits: 1, en: { label: 'W', key: 'w' }, ru: { label: 'Ц', key: 'ц' } }),
++				this.createLocalizedKeyButton({ id: 'KeyE', widthUnits: 1, en: { label: 'E', key: 'e' }, ru: { label: 'У', key: 'у' } }),
++				this.createLocalizedKeyButton({ id: 'KeyR', widthUnits: 1, en: { label: 'R', key: 'r' }, ru: { label: 'К', key: 'к' } }),
++				this.createLocalizedKeyButton({ id: 'KeyT', widthUnits: 1, en: { label: 'T', key: 't' }, ru: { label: 'Е', key: 'е' } }),
++				this.createLocalizedKeyButton({ id: 'KeyY', widthUnits: 1, en: { label: 'Y', key: 'y' }, ru: { label: 'Н', key: 'н' } }),
++				this.createLocalizedKeyButton({ id: 'KeyU', widthUnits: 1, en: { label: 'U', key: 'u' }, ru: { label: 'Г', key: 'г' } }),
++				this.createLocalizedKeyButton({ id: 'KeyI', widthUnits: 1, en: { label: 'I', key: 'i' }, ru: { label: 'Ш', key: 'ш' } }),
++				this.createLocalizedKeyButton({ id: 'KeyO', widthUnits: 1, en: { label: 'O', key: 'o' }, ru: { label: 'Щ', key: 'щ' } }),
++				this.createLocalizedKeyButton({ id: 'KeyP', widthUnits: 1, en: { label: 'P', key: 'p' }, ru: { label: 'З', key: 'з' } }),
++				this.createLocalizedKeyButton({
++					id: 'BracketLeft',
++					widthUnits: 1,
++					en: { label: '[', key: '[' },
++					ru: { label: 'Х', key: 'х' },
++					enShift: { label: '{', key: '{' },
++					fn: { label: '{', key: '{' },
++				}),
++				this.createLocalizedKeyButton({
++					id: 'BracketRight',
++					widthUnits: 1,
++					en: { label: ']', key: ']' },
++					ru: { label: 'Ъ', key: 'ъ' },
++					enShift: { label: '}', key: '}' },
++					fn: { label: '}', key: '}' },
++				}),
++				this.createLocalizedKeyButton({
++					id: 'Backslash',
++					widthUnits: 1.5,
++					en: { label: '\\', key: '\\' },
++					ru: { label: '\\', key: '\\' },
++					enShift: { label: '|', key: '|' },
++					fn: { label: '|', key: '|' },
++				}),
 +			],
-+				[
-+					{
-+						id: 'vk-lang',
-+						label: this.keybarLayout.toUpperCase(),
-+						tap: { type: 'command', command: CodeServerClient.KEYBAR_TOGGLE_LAYOUT_COMMAND_ID },
-+					},
-+					{
-+						id: 'vk-ime',
-+						label: this.nativeImeEnabled ? 'IME On' : 'IME Off',
-+						tap: { type: 'command', command: CodeServerClient.KEYBAR_TOGGLE_NATIVE_IME_COMMAND_ID },
-+					},
-+					{ id: 'vk-space', label: 'Space', tap: { type: 'key', key: ' ', code: 'Space' } },
-+					{ id: 'vk-left', label: '<-', tap: { type: 'key', key: 'ArrowLeft', code: 'ArrowLeft' } },
-+					{ id: 'vk-down', label: 'v', tap: { type: 'key', key: 'ArrowDown', code: 'ArrowDown' } },
-+				{ id: 'vk-up', label: '^', tap: { type: 'key', key: 'ArrowUp', code: 'ArrowUp' } },
-+				{ id: 'vk-right', label: '->', tap: { type: 'key', key: 'ArrowRight', code: 'ArrowRight' } },
-+				{ id: 'vk-enter', label: 'Enter', tap: { type: 'key', key: 'Enter', code: 'Enter' } },
++			[
++				this.createToggleButton('CapsLock', 'Caps', 1.75),
++				this.createLocalizedKeyButton({ id: 'KeyA', widthUnits: 1, en: { label: 'A', key: 'a' }, ru: { label: 'Ф', key: 'ф' } }),
++				this.createLocalizedKeyButton({ id: 'KeyS', widthUnits: 1, en: { label: 'S', key: 's' }, ru: { label: 'Ы', key: 'ы' } }),
++				this.createLocalizedKeyButton({ id: 'KeyD', widthUnits: 1, en: { label: 'D', key: 'd' }, ru: { label: 'В', key: 'в' } }),
++				this.createLocalizedKeyButton({ id: 'KeyF', widthUnits: 1, en: { label: 'F', key: 'f' }, ru: { label: 'А', key: 'а' } }),
++				this.createLocalizedKeyButton({ id: 'KeyG', widthUnits: 1, en: { label: 'G', key: 'g' }, ru: { label: 'П', key: 'п' } }),
++				this.createLocalizedKeyButton({ id: 'KeyH', widthUnits: 1, en: { label: 'H', key: 'h' }, ru: { label: 'Р', key: 'р' } }),
++				this.createLocalizedKeyButton({ id: 'KeyJ', widthUnits: 1, en: { label: 'J', key: 'j' }, ru: { label: 'О', key: 'о' } }),
++				this.createLocalizedKeyButton({ id: 'KeyK', widthUnits: 1, en: { label: 'K', key: 'k' }, ru: { label: 'Л', key: 'л' } }),
++				this.createLocalizedKeyButton({ id: 'KeyL', widthUnits: 1, en: { label: 'L', key: 'l' }, ru: { label: 'Д', key: 'д' } }),
++				this.createLocalizedKeyButton({
++					id: 'Semicolon',
++					widthUnits: 1,
++					en: { label: ';', key: ';' },
++					ru: { label: 'Ж', key: 'ж' },
++					enShift: { label: ':', key: ':' },
++					fn: { label: ':', key: ':' },
++				}),
++				this.createLocalizedKeyButton({
++					id: 'Quote',
++					widthUnits: 1,
++					en: { label: '\'', key: '\'' },
++					ru: { label: 'Э', key: 'э' },
++					enShift: { label: '"', key: '"' },
++					fn: { label: '"', key: '"' },
++				}),
++				this.createFixedKeyButton('Enter', '↵', 'Enter', 2.25),
++			],
++			[
++				this.createModifierButton('ShiftLeft', '⇧', 2.25),
++				this.createLocalizedKeyButton({ id: 'KeyZ', widthUnits: 1, en: { label: 'Z', key: 'z' }, ru: { label: 'Я', key: 'я' } }),
++				this.createLocalizedKeyButton({ id: 'KeyX', widthUnits: 1, en: { label: 'X', key: 'x' }, ru: { label: 'Ч', key: 'ч' } }),
++				this.createLocalizedKeyButton({ id: 'KeyC', widthUnits: 1, en: { label: 'C', key: 'c' }, ru: { label: 'С', key: 'с' } }),
++				this.createLocalizedKeyButton({ id: 'KeyV', widthUnits: 1, en: { label: 'V', key: 'v' }, ru: { label: 'М', key: 'м' } }),
++				this.createLocalizedKeyButton({ id: 'KeyB', widthUnits: 1, en: { label: 'B', key: 'b' }, ru: { label: 'И', key: 'и' } }),
++				this.createLocalizedKeyButton({ id: 'KeyN', widthUnits: 1, en: { label: 'N', key: 'n' }, ru: { label: 'Т', key: 'т' } }),
++				this.createLocalizedKeyButton({ id: 'KeyM', widthUnits: 1, en: { label: 'M', key: 'm' }, ru: { label: 'Ь', key: 'ь' } }),
++				this.createLocalizedKeyButton({
++					id: 'Comma',
++					widthUnits: 1,
++					en: { label: ',', key: ',' },
++					ru: { label: 'Б', key: 'б' },
++					enShift: { label: '<', key: '<' },
++					fn: { label: '<', key: '<' },
++				}),
++				this.createLocalizedKeyButton({
++					id: 'Period',
++					widthUnits: 1,
++					en: { label: '.', key: '.' },
++					ru: { label: 'Ю', key: 'ю' },
++					enShift: { label: '>', key: '>' },
++					fn: { label: '>', key: '>' },
++				}),
++				this.createLocalizedKeyButton({
++					id: 'Slash',
++					widthUnits: 1,
++					en: { label: '/', key: '/' },
++					ru: { label: '.', key: '.' },
++					enShift: { label: '?', key: '?' },
++					ruShift: { label: ',', key: ',' },
++					fn: { label: '?', key: '?' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'ArrowUp',
++					widthUnits: 1,
++					normal: { label: '↑', key: 'ArrowUp' },
++					fn: { label: 'PgUp', key: 'PageUp' },
++				}),
++				this.createPlaceholderButton('ShiftRowPlaceholder', '', 1.75),
++			],
++			[
++				this.createModifierButton('CtrlLeft', 'Ctrl', 1.25),
++				this.createToggleButton('Fn', this.fnModeEnabled ? 'Fn●' : 'Fn', 1.25),
++				this.createToggleButton('LangSwitch', this.keybarLayout.toUpperCase(), 1.25),
++				this.createModifierButton('AltLeft', 'Alt', 1.25),
++				this.createFixedKeyButton('Space', '', ' ', 6.25),
++				this.createModifierButton('AltRight', 'Alt', 1.25),
++				this.createModifierButton('CtrlRight', 'Ctrl', 1.25),
++				this.createShiftFnKeyButton({
++					id: 'ArrowLeft',
++					widthUnits: 1,
++					normal: { label: '←', key: 'ArrowLeft' },
++					fn: { label: 'Home', key: 'Home' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'ArrowDown',
++					widthUnits: 1,
++					normal: { label: '↓', key: 'ArrowDown' },
++					fn: { label: 'PgDn', key: 'PageDown' },
++				}),
++				this.createShiftFnKeyButton({
++					id: 'ArrowRight',
++					widthUnits: 1,
++					normal: { label: '→', key: 'ArrowRight' },
++					fn: { label: 'End', key: 'End' },
++				}),
 +			],
 +		];
++	}
++
++	private createFixedKeyButton(id: string, label: string, key: string, widthUnits: number): IKeybarButtonConfig {
++		return {
++			id,
++			label,
++			widthUnits,
++			tap: { type: 'key', key, code: id },
++		};
++	}
++
++	private createModifierButton(id: string, label: string, widthUnits: number): IKeybarButtonConfig {
++		return {
++			id,
++			label,
++			widthUnits,
++			tap: { type: 'noop' },
++		};
++	}
++
++	private createToggleButton(id: string, label: string, widthUnits: number): IKeybarButtonConfig {
++		return {
++			id,
++			label,
++			widthUnits,
++			tap: { type: 'noop' },
++		};
++	}
++
++	private createPlaceholderButton(id: string, label: string, widthUnits: number): IKeybarButtonConfig {
++		return {
++			id,
++			label,
++			widthUnits,
++			tap: { type: 'noop' },
++		};
++	}
++
++	private createShiftFnKeyButton(config: IKeybarShiftFnKeyConfig): IKeybarButtonConfig {
++		const shiftActive = this.modifierState.shift !== 'off';
++		const resolvedVariant = this.fnModeEnabled && config.fn
++			? config.fn
++			: shiftActive && config.shift
++				? config.shift
++				: config.normal;
++		return {
++			id: config.id,
++			label: resolvedVariant.label,
++			widthUnits: config.widthUnits,
++			secondaryLabel: !this.fnModeEnabled && config.fn ? config.fn.label : undefined,
++			tap: { type: 'key', key: resolvedVariant.key, code: config.id },
++		};
++	}
++
++	private createLocalizedKeyButton(config: IKeybarLocalizedKeyConfig): IKeybarButtonConfig {
++		const shiftActive = this.modifierState.shift !== 'off';
++		let resolvedVariant: IKeybarCharacterVariant;
++		let shouldApplyLetterCase = false;
++
++		if (this.fnModeEnabled && config.fn) {
++			resolvedVariant = config.fn;
++		} else if (this.keybarLayout === 'ru') {
++			if (shiftActive && config.ruShift) {
++				resolvedVariant = config.ruShift;
++			} else {
++				resolvedVariant = config.ru;
++				shouldApplyLetterCase = true;
++			}
++		} else if (shiftActive && config.enShift) {
++			resolvedVariant = config.enShift;
++		} else {
++			resolvedVariant = config.en;
++			shouldApplyLetterCase = true;
++		}
++
++		const outputKey = shouldApplyLetterCase ? this.normalizeLetterKey(resolvedVariant.key) : resolvedVariant.key;
++		return {
++			id: config.id,
++			label: resolvedVariant.label,
++			widthUnits: config.widthUnits,
++			secondaryLabel: !this.fnModeEnabled && config.fn ? config.fn.label : undefined,
++			tap: { type: 'key', key: outputKey, code: config.id },
++		};
++	}
++
++	private normalizeLetterKey(key: string): string {
++		if (!this.isLetterCharacter(key)) {
++			return key;
++		}
++		return this.shouldUppercaseLetters() ? key.toLocaleUpperCase() : key.toLocaleLowerCase();
++	}
++
++	private shouldUppercaseLetters(): boolean {
++		const shiftActive = this.modifierState.shift !== 'off';
++		return shiftActive !== this.capsLockEnabled;
++	}
++
++	private isLetterCharacter(key: string): boolean {
++		return key.length === 1 && key.toLocaleLowerCase() !== key.toLocaleUpperCase();
 +	}
 +
 +	private captureRestorableFocusTarget(): HTMLElement | undefined {
@@ -702,40 +1092,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return true;
 +	}
 +
-+	private tryToggleModifierFromAction(buttonConfig: IKeybarButtonConfig, action: IKeybarActionConfig): boolean {
-+		if (action.type !== 'noop') {
-+			return false;
-+		}
-+
-+		const modifierKind = this.toModifierKind(buttonConfig.id);
-+		if (!modifierKind) {
-+			return false;
-+		}
-+
-+		const currentState = this.modifierState[modifierKind];
-+		let nextState: KeybarModifierState;
-+		switch (currentState) {
-+			case 'off':
-+				nextState = 'latched';
-+				break;
-+			case 'latched':
-+				nextState = 'locked';
-+				break;
-+			case 'locked':
-+				nextState = 'off';
-+				break;
-+		}
-+
-+		this.modifierState[modifierKind] = nextState;
-+		this.renderModifierButtons();
-+		return true;
-+	}
-+
 +	private renderModifierButtons(): void {
-+		for (const [modifierKind, button] of this.modifierButtonByKind) {
++		for (const [modifierKind, buttons] of this.modifierButtonByKind) {
 +			const state = this.modifierState[modifierKind];
-+			button.classList.toggle('cs-dermux-keybar-btn-active', state !== 'off');
-+			button.classList.toggle('cs-dermux-keybar-btn-locked', state === 'locked');
++			for (const button of buttons) {
++				button.classList.toggle('cs-dermux-keybar-btn-active', state !== 'off');
++				button.classList.toggle('cs-dermux-keybar-btn-locked', state === 'locked');
++			}
 +		}
 +	}
 +
@@ -767,249 +1130,21 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			return;
 +		}
 +
-+		const config = await this.readKeybarConfig();
-+		if (!config) {
-+			return;
-+		}
-+
 +		rowsContainer.textContent = '';
 +		this.modifierButtonByKind.clear();
-+		for (const rowConfig of config.rows) {
-+			rowsContainer.appendChild(this.createKeybarRow(rowConfig));
-+		}
-+		for (const rowConfig of this.buildVirtualKeyboardRows()) {
++		for (const rowConfig of this.buildHardcodedKeyboardRows()) {
 +			rowsContainer.appendChild(this.createKeybarRow(rowConfig));
 +		}
 +
++		this.renderModifierButtons();
 +		this.setKeybarVisibility();
 +		if (showResultNotification) {
 +			this.notificationService.notify({
 +				severity: Severity.Info,
-+				message: localize('dermux.keybarReloaded', "Dermux keybar config reloaded."),
++				message: localize('dermux.keybarReloaded', "Dermux keybar reloaded."),
 +			});
 +		}
 +	}
-+
-+	private async readKeybarConfig(): Promise<IKeybarConfigModel | undefined> {
-+		const workspaceRaw = await this.readWorkspaceKeybarConfigRaw();
-+		const configuredRaw = this.storageService.get(CodeServerClient.KEYBAR_CONFIG_STORAGE_KEY, StorageScope.APPLICATION);
-+		const source = workspaceRaw?.trim() || configuredRaw?.trim();
-+		if (!source) {
-+			return DEFAULT_KEYBAR_CONFIG;
-+		}
-+
-+		const parsedConfig = await this.parseAndValidateKeybarConfig(source);
-+		if (parsedConfig) {
-+			return parsedConfig;
-+		}
-+
-+		// Corrupted app-level cache should not poison startup forever.
-+		if (!workspaceRaw && configuredRaw?.trim()) {
-+			this.storageService.remove(CodeServerClient.KEYBAR_CONFIG_STORAGE_KEY, StorageScope.APPLICATION);
-+		}
-+
-+		this.notificationService.notify({
-+			severity: Severity.Warning,
-+			message: localize('dermux.invalidKeybarConfig', "Invalid Dermux keybar config. Falling back to default."),
-+		});
-+
-+		return DEFAULT_KEYBAR_CONFIG;
-+	}
-+
-+	private watchWorkspaceKeybarConfig(): void {
-+		const configUri = this.getWorkspaceKeybarConfigUri();
-+		if (!configUri) {
-+			return;
-+		}
-+
-+		this.keybarConfigWatchStore.clear();
-+		this.keybarConfigWatchStore.add(this.fileService.watch(configUri));
-+		this.keybarConfigWatchStore.add(this.fileService.onDidFilesChange(event => {
-+			if (event.contains(configUri)) {
-+				void this.reloadKeybarConfig(false);
-+			}
-+		}));
-+	}
-+
-+	private async readWorkspaceKeybarConfigRaw(): Promise<string | undefined> {
-+		const configUri = this.getWorkspaceKeybarConfigUri();
-+		if (!configUri) {
-+			return undefined;
-+		}
-+
-+		try {
-+			const file = await this.fileService.readFile(configUri);
-+			return file.value.toString();
-+		} catch (error) {
-+			if (error instanceof FileOperationError && error.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
-+				return undefined;
-+			}
-+			this.logService.warn(`[Dermux Keybar] failed to read config file: ${String(error)}`);
-+			return undefined;
-+		}
-+	}
-+
-+	private getWorkspaceKeybarConfigUri() {
-+		const workspace = this.workspaceContextService.getWorkspace();
-+		const firstFolder = workspace.folders[0];
-+		if (!firstFolder) {
-+			return undefined;
-+		}
-+
-+		return joinPath(firstFolder.uri, CodeServerClient.KEYBAR_WORKSPACE_CONFIG_RELATIVE_PATH);
-+	}
-+
-+	private async loadHjsonModule(): Promise<IHjsonModule | undefined> {
-+		if (!this.hjsonModulePromise) {
-+			this.hjsonModulePromise = (async () => {
-+				try {
-+					const moduleUrl = new URL('../../../../node_modules/hjson/bundle/hjson.js', import.meta.url).toString();
-+					await eval(`import("${moduleUrl}")`);
-+					const hjson = (globalThis as { Hjson?: IHjsonModule }).Hjson;
-+					if (!hjson || typeof hjson.parse !== 'function' || typeof hjson.stringify !== 'function') {
-+						this.logService.warn('[Dermux Keybar] HJSON bundle loaded but global Hjson parser is unavailable');
-+						return undefined;
-+					}
-+					return hjson;
-+				} catch (error) {
-+					this.logService.warn(`[Dermux Keybar] failed to load HJSON parser: ${String(error)}`);
-+					return undefined;
-+				}
-+			})();
-+		}
-+
-+		return this.hjsonModulePromise;
-+	}
-+
-+	private async parseAndValidateKeybarConfig(rawHjson: string): Promise<IKeybarConfigModel | undefined> {
-+		const hjson = await this.loadHjsonModule();
-+		if (!hjson) {
-+			return undefined;
-+		}
-+
-+		try {
-+			const parsed = hjson.parse(rawHjson);
-+			return this.toKeybarConfigModel(parsed);
-+		} catch (error) {
-+			this.logService.warn(`[Dermux Keybar] failed to parse config: ${String(error)}`);
-+			return undefined;
-+		}
-+	}
-+
-+	private toKeybarConfigModel(parsed: unknown): IKeybarConfigModel | undefined {
-+		if (typeof parsed !== 'object' || parsed === null) {
-+			return undefined;
-+		}
-+
-+		const configLike = parsed as { version?: unknown; rows?: unknown };
-+		if (configLike.version !== 1 || !Array.isArray(configLike.rows) || configLike.rows.length !== 2) {
-+			return undefined;
-+		}
-+
-+		const firstRow = this.toKeybarRow(configLike.rows[0]);
-+		const secondRow = this.toKeybarRow(configLike.rows[1]);
-+		if (!firstRow || !secondRow) {
-+			return undefined;
-+		}
-+
-+		return {
-+			version: 1,
-+			rows: [firstRow, secondRow],
-+		};
-+	}
-+
-+	private toKeybarRow(row: unknown): IKeybarButtonConfig[] | undefined {
-+		if (!Array.isArray(row) || row.length < 1) {
-+			return undefined;
-+		}
-+
-+		const buttons: IKeybarButtonConfig[] = [];
-+		for (const button of row) {
-+			const normalized = this.toKeybarButton(button);
-+			if (!normalized) {
-+				return undefined;
-+			}
-+			buttons.push(normalized);
-+		}
-+
-+		return buttons;
-+	}
-+
-+	private toKeybarButton(rawButton: unknown): IKeybarButtonConfig | undefined {
-+		if (typeof rawButton !== 'object' || rawButton === null) {
-+			return undefined;
-+		}
-+
-+		const buttonLike = rawButton as { id?: unknown; label?: unknown; tap?: unknown; up?: unknown; down?: unknown };
-+		if (typeof buttonLike.id !== 'string' || typeof buttonLike.label !== 'string') {
-+			return undefined;
-+		}
-+
-+		const tap = this.toKeybarAction(buttonLike.tap);
-+		if (!tap) {
-+			return undefined;
-+		}
-+
-+		const up = buttonLike.up === undefined ? undefined : this.toKeybarAction(buttonLike.up);
-+		const down = buttonLike.down === undefined ? undefined : this.toKeybarAction(buttonLike.down);
-+		if (buttonLike.up !== undefined && !up) {
-+			return undefined;
-+		}
-+		if (buttonLike.down !== undefined && !down) {
-+			return undefined;
-+		}
-+
-+		return { id: buttonLike.id, label: buttonLike.label, tap, up, down };
-+	}
-+
-+	private toKeybarAction(rawAction: unknown): IKeybarActionConfig | undefined {
-+		if (typeof rawAction !== 'object' || rawAction === null) {
-+			return undefined;
-+		}
-+
-+		const actionLike = rawAction as { type?: unknown; command?: unknown; key?: unknown; code?: unknown; text?: unknown; ctrl?: unknown; alt?: unknown; shift?: unknown; meta?: unknown };
-+		if (actionLike.type !== 'command' && actionLike.type !== 'key' && actionLike.type !== 'text' && actionLike.type !== 'noop') {
-+			return undefined;
-+		}
-+
-+		if (actionLike.type === 'command' && typeof actionLike.command !== 'string') {
-+			return undefined;
-+		}
-+		if (actionLike.type === 'key' && typeof actionLike.key !== 'string') {
-+			return undefined;
-+		}
-+		if (actionLike.code !== undefined && typeof actionLike.code !== 'string') {
-+			return undefined;
-+		}
-+		if (actionLike.type === 'text' && typeof actionLike.text !== 'string') {
-+			return undefined;
-+		}
-+		if (actionLike.ctrl !== undefined && typeof actionLike.ctrl !== 'boolean') {
-+			return undefined;
-+		}
-+		if (actionLike.alt !== undefined && typeof actionLike.alt !== 'boolean') {
-+			return undefined;
-+		}
-+		if (actionLike.shift !== undefined && typeof actionLike.shift !== 'boolean') {
-+			return undefined;
-+		}
-+		if (actionLike.meta !== undefined && typeof actionLike.meta !== 'boolean') {
-+			return undefined;
-+		}
-+
-+		return {
-+			type: actionLike.type,
-+			command: typeof actionLike.command === 'string' ? actionLike.command : undefined,
-+			key: typeof actionLike.key === 'string' ? actionLike.key : undefined,
-+			code: typeof actionLike.code === 'string' ? actionLike.code : undefined,
-+			text: typeof actionLike.text === 'string' ? actionLike.text : undefined,
-+			ctrl: typeof actionLike.ctrl === 'boolean' ? actionLike.ctrl : undefined,
-+			alt: typeof actionLike.alt === 'boolean' ? actionLike.alt : undefined,
-+			shift: typeof actionLike.shift === 'boolean' ? actionLike.shift : undefined,
-+			meta: typeof actionLike.meta === 'boolean' ? actionLike.meta : undefined,
-+		};
-+	}
-+
 +	private async dispatchKeybarAction(action: IKeybarActionConfig): Promise<boolean> {
 +		if (action.type === 'noop') {
 +			return true;
@@ -1051,8 +1186,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			}
 +			const isPrintableCharacter = action.key.length === 1;
 +			if (isPrintableCharacter && !hasHardModifiers) {
-+				const text = modifiers.shift ? action.key.toLocaleUpperCase() : action.key;
-+				const didType = await this.typeText(text);
++				const didType = await this.typeText(action.key);
 +				return this.finishNonModifierAction(didType);
 +			}
 +			const didDispatch = this.dispatchSyntheticKey(action);
@@ -1223,7 +1357,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -282,13 +1308,12 @@ export class CodeServerClient extends Di
+@@ -282,13 +1438,12 @@ export class CodeServerClient extends Di
  		}
  
  		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
@@ -1240,7 +1374,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1324,64 @@ export class CodeServerClient extends Di
+@@ -299,7 +1454,79 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1257,6 +1391,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +		this.keybarHeightPx = heightPx;
 +		document.documentElement.style.setProperty('--cs-dermux-keybar-height', `${heightPx}px`);
++		this.applyWorkbenchBottomInset();
 +
 +		// Prompt workbench layout recomputation when keybar visibility/size changes.
 +		window.dispatchEvent(new Event('resize'));
@@ -1275,6 +1410,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +		this.keyboardOverlapPx = overlapPx;
 +		document.documentElement.style.setProperty('--cs-dermux-keyboard-overlap', `${overlapPx}px`);
++		this.applyWorkbenchBottomInset();
 +
 +		// Prompt workbench layout recomputation when keyboard overlap changes.
 +		window.dispatchEvent(new Event('resize'));
@@ -1283,6 +1419,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private clearKeyboardOverlapInset(): void {
 +		this.keyboardOverlapPx = 0;
 +		document.documentElement.style.setProperty('--cs-dermux-keyboard-overlap', '0px');
++		this.applyWorkbenchBottomInset();
++	}
++
++	private applyWorkbenchBottomInset(): void {
++		const workbenchRoot = document.querySelector('.monaco-workbench');
++		const targetElement = workbenchRoot instanceof HTMLElement ? workbenchRoot : document.body;
++		if (!(targetElement instanceof HTMLElement)) {
++			return;
++		}
++
++		const keybarInsetPx = this.keybarVisible ? this.keybarHeightPx : 0;
++		const totalInsetPx = Math.max(0, keybarInsetPx + this.keyboardOverlapPx);
++		targetElement.style.setProperty('padding-bottom', `${totalInsetPx}px`);
 +	}
 +
 +	private isDermuxTouchSession(): boolean {
@@ -1311,7 +1460,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
 +++ code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
-@@ -1,18 +1,14 @@
+@@ -1,28 +1,44 @@
  :root {
  	--cs-dermux-keybar-height: 0px;
 +	--cs-dermux-keyboard-overlap: 0px;
@@ -1329,10 +1478,43 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	right: 0;
 -	bottom: 0;
 +	bottom: var(--cs-dermux-keyboard-overlap);
++	overflow: hidden;
++	opacity: 1 !important;
++	filter: none !important;
++	backdrop-filter: none !important;
++	-webkit-backdrop-filter: none !important;
++	mix-blend-mode: normal !important;
++	isolation: isolate;
++	contain: paint;
  	display: flex;
  	flex-direction: column;
  	gap: 6px;
-@@ -34,7 +30,6 @@ body.cs-dermux-keybar-enabled .monaco-wo
+ 	padding: 8px 8px calc(8px + var(--cs-dermux-safe-area-bottom));
+-	background: color-mix(in srgb, var(--vscode-editor-background) 92%, black);
+-	border-top: 1px solid var(--vscode-widget-border);
+-	z-index: 1700;
++	background: #000000 !important;
++	border-top: 1px solid #3a3a3a;
++	z-index: 2147483645;
++}
++
++.cs-dermux-keybar::before {
++	content: '';
++	position: absolute;
++	inset: 0;
++	background: #000000 !important;
++	opacity: 1 !important;
++	pointer-events: none;
++	z-index: 0;
+ }
+ 
+ .cs-dermux-keybar-rows {
++	position: relative;
++	z-index: 1;
+ 	display: flex;
+ 	flex-direction: column;
+ 	gap: 6px;
+@@ -34,22 +50,56 @@ body.cs-dermux-keybar-enabled .monaco-wo
  
  .cs-dermux-keybar-row {
  	display: grid;
@@ -1340,21 +1522,74 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	gap: 6px;
  }
  
-@@ -62,21 +57,30 @@ body.cs-dermux-keybar-enabled .monaco-wo
+ .cs-dermux-keybar-btn {
++	position: relative;
++	display: flex;
++	align-items: center;
++	justify-content: center;
+ 	height: 40px;
+ 	min-width: 40px;
+-	border: 1px solid var(--vscode-widget-border);
++	padding: 0 6px;
++	border: 1px solid #505050;
+ 	border-radius: 6px;
+-	background: var(--vscode-button-secondaryBackground);
+-	color: var(--vscode-button-secondaryForeground);
++	background: #2f2f2f !important;
++	opacity: 1 !important;
++	filter: none !important;
++	backdrop-filter: none !important;
++	-webkit-backdrop-filter: none !important;
++	mix-blend-mode: normal !important;
++	color: #ffffff;
+ 	font-size: 11px;
+ 	font-weight: 600;
+ 	touch-action: none;
+ }
+ 
++.cs-dermux-keybar-btn-label {
++	line-height: 1;
++	white-space: nowrap;
++	pointer-events: none;
++}
++
++.cs-dermux-keybar-btn-secondary-label {
++	position: absolute;
++	top: 3px;
++	right: 4px;
++	font-size: 9px;
++	opacity: 0.75;
++	pointer-events: none;
++}
++
++.cs-dermux-keybar-btn.cs-dermux-keybar-btn-placeholder {
++	border-style: dashed;
++	opacity: 0.35;
++	pointer-events: none;
++}
++
++.cs-dermux-keybar-btn.cs-dermux-keybar-btn-placeholder .cs-dermux-keybar-btn-label {
++	opacity: 0;
++}
++
+ .cs-dermux-keybar-btn:active {
+ 	transform: translateY(1px);
+ }
+@@ -62,21 +112,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
  	border-color: var(--vscode-charts-yellow);
  }
  
 +.cs-dermux-keybar-btn.cs-dermux-keybar-btn-active {
-+	border-color: #a3a3a3 !important;
-+	background: #d9d9d9 !important;
-+	color: #111111 !important;
++	border-color: #9a9a9a !important;
++	background: #6f6f6f !important;
++	color: #ffffff !important;
 +}
 +
 +.cs-dermux-keybar-btn.cs-dermux-keybar-btn-locked {
-+	border-color: #7e7e7e !important;
-+	background: #efefef !important;
-+	color: #111111 !important;
-+	box-shadow: inset 0 0 0 2px #666666;
++	border-color: #b0b0b0 !important;
++	background: #8d8d8d !important;
++	color: #ffffff !important;
++	box-shadow: inset 0 0 0 2px #5f5f5f;
 +}
 +
  .cs-dermux-keybar-handle {
@@ -1363,16 +1598,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 -	bottom: calc(10px + var(--cs-dermux-safe-area-bottom));
 -	height: 32px;
 -	padding: 0 10px;
+-	border: 1px solid var(--vscode-widget-border);
+-	border-radius: 16px;
+-	background: var(--vscode-button-background);
+-	color: var(--vscode-button-foreground);
+-	font-size: 11px;
 +	left: 10px;
 +	bottom: calc(10px + var(--cs-dermux-safe-area-bottom) + var(--cs-dermux-keyboard-overlap) + var(--cs-dermux-keybar-height));
 +	height: 36px;
 +	padding: 0 12px;
- 	border: 1px solid var(--vscode-widget-border);
--	border-radius: 16px;
++	border: 1px solid #5a5a5a;
 +	border-radius: 18px;
- 	background: var(--vscode-button-background);
- 	color: var(--vscode-button-foreground);
--	font-size: 11px;
++	background: #2f2f2f;
++	color: #ffffff;
 +	font-size: 12px;
  	font-weight: 600;
 -	z-index: 1701;
@@ -1380,7 +1618,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 -
 -.cs-dermux-keybar-handle.cs-dermux-keybar-handle-hidden {
 -	display: none;
-+	z-index: 2147483000;
++	opacity: 1 !important;
++	filter: none !important;
++	backdrop-filter: none !important;
++	-webkit-backdrop-filter: none !important;
++	mix-blend-mode: normal !important;
++	z-index: 2147483646;
  }
 Index: code-server/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
 ===================================================================
