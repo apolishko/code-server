@@ -51,7 +51,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
-@@ -1,28 +1,116 @@
+@@ -1,28 +1,117 @@
 -import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
 -import { isMobile } from '../../base/common/platform.js';
 +import { Disposable, DisposableStore, toDisposable } from "../../base/common/lifecycle.js";
@@ -129,6 +129,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
  export class CodeServerClient extends Disposable {
  	static LOGOUT_COMMAND_ID = 'code-server.logout';
++	static DERMUX_NO_SW_QUERY_PARAM = 'dermux-nosw';
  	static KEYBAR_TOGGLE_COMMAND_ID = 'dermux.keybar.toggleVisibility';
 +	static KEYBAR_RELOAD_COMMAND_ID = 'dermux.keybar.reloadConfig';
 +	static KEYBAR_TOGGLE_LAYOUT_COMMAND_ID = 'dermux.keybar.toggleLayout';
@@ -171,8 +172,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	) {
  		super();
  	}
-@@ -102,7 +190,8 @@ export class CodeServerClient extends Di
- 			await this.registerServiceWorker(this.productService.serviceWorker);
+@@ -99,10 +188,16 @@ export class CodeServerClient extends Di
+ 		}
+ 
+ 		if (this.productService.serviceWorker) {
+-			await this.registerServiceWorker(this.productService.serviceWorker);
++			if (this.shouldBypassServiceWorker()) {
++				await this.unregisterServiceWorkersForScope(this.productService.serviceWorker.scope, 'dermux touch session or query flag');
++				this.reloadOnceIfServiceWorkerStillControlling();
++			} else {
++				await this.registerServiceWorker(this.productService.serviceWorker);
++			}
  		}
  
 -		this.addKeybarToggleCommand();
@@ -181,11 +191,63 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.createBottomKeybarSkeleton();
  	}
  
-@@ -190,24 +279,166 @@ export class CodeServerClient extends Di
+@@ -190,24 +285,218 @@ export class CodeServerClient extends Di
  		}
  	}
  
 -	private addKeybarToggleCommand(): void {
++	private async unregisterServiceWorkersForScope(scope: string, reason: string): Promise<void> {
++		if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
++			return;
++		}
++
++		try {
++			const targetScopePath = new URL(scope, window.location.origin).pathname;
++			const registrations = await navigator.serviceWorker.getRegistrations();
++			let matchedRegistrations = 0;
++			let unregisteredRegistrations = 0;
++
++			for (const registration of registrations) {
++				const registrationScopePath = new URL(registration.scope, window.location.origin).pathname;
++				const scopeMatches = registrationScopePath.startsWith(targetScopePath) || targetScopePath.startsWith(registrationScopePath);
++				if (!scopeMatches) {
++					continue;
++				}
++
++				matchedRegistrations++;
++				const didUnregister = await registration.unregister();
++				if (didUnregister) {
++					unregisteredRegistrations++;
++				}
++			}
++
++			this.logService.info(`[Service Worker] bypass (${reason}), unregistered ${unregisteredRegistrations}/${matchedRegistrations} registrations for scope ${targetScopePath}`);
++		} catch (error: any) {
++			this.logService.error('[Service Worker] unregister', error as Error);
++		}
++	}
++
++	private reloadOnceIfServiceWorkerStillControlling(): void {
++		if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
++			return;
++		}
++		if (!navigator.serviceWorker.controller) {
++			return;
++		}
++
++		const reloadMarker = 'dermux-sw-bypass-reload-done';
++		try {
++			if (sessionStorage.getItem(reloadMarker)) {
++				return;
++			}
++			sessionStorage.setItem(reloadMarker, '1');
++		} catch {
++			// Ignore sessionStorage failures and continue with a best-effort reload.
++		}
++
++		window.location.reload();
++	}
++
 +	private initializeNativeImeControl(): void {
 +		if (!this.isDermuxTouchSession()) {
 +			this.nativeImeEnabled = true;
@@ -350,7 +412,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			return;
  		}
  
-@@ -218,20 +449,25 @@ export class CodeServerClient extends Di
+@@ -218,20 +507,25 @@ export class CodeServerClient extends Di
  
  		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
  		this.keybarVisible = storedVisibility ?? true;
@@ -381,7 +443,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			this.setKeybarVisibility();
  		});
  
-@@ -239,6 +475,7 @@ export class CodeServerClient extends Di
+@@ -239,6 +533,7 @@ export class CodeServerClient extends Di
  		body.append(keybar, handle);
  
  		this.keybarContainer = keybar;
@@ -389,7 +451,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +484,764 @@ export class CodeServerClient extends Di
+@@ -247,33 +542,764 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -400,13 +462,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +		}));
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -1161,7 +1223,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -282,13 +1250,12 @@ export class CodeServerClient extends Di
+@@ -282,13 +1308,12 @@ export class CodeServerClient extends Di
  		}
  
  		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
@@ -1178,7 +1240,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1266,57 @@ export class CodeServerClient extends Di
+@@ -299,7 +1324,64 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1236,6 +1298,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		const mobileSizedViewport = smallestViewportPx > 0 && smallestViewportPx <= 1024;
 +
 +		return isAndroid || isMobile || uaSaysAndroid || uaDataSaysMobile || (touchPoints > 0 && hasCoarsePointer && mobileSizedViewport);
++	}
++
++	private shouldBypassServiceWorker(): boolean {
++		const searchParams = new URLSearchParams(window.location.search);
++		const noServiceWorkerParam = searchParams.get(CodeServerClient.DERMUX_NO_SW_QUERY_PARAM);
++		const noServiceWorkerRequested = noServiceWorkerParam !== null && (noServiceWorkerParam === '' || noServiceWorkerParam === '1' || noServiceWorkerParam.toLowerCase() === 'true');
++		return noServiceWorkerRequested || this.isDermuxTouchSession();
  	}
  }
 Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
