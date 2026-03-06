@@ -438,7 +438,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +525,1038 @@ export class CodeServerClient extends Di
+@@ -247,33 +525,1095 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -554,9 +554,31 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		let latestDeltaY = 0;
 +		let trackingPointer = false;
 +		let focusRestoreTarget: HTMLElement | undefined;
++		let swipePopover: HTMLDivElement | undefined;
 +
 +		const resetPreview = () => {
 +			button.classList.remove('cs-dermux-keybar-btn-swipe-up', 'cs-dermux-keybar-btn-swipe-down');
++		};
++		const hideSwipePopover = () => {
++			swipePopover?.remove();
++			swipePopover = undefined;
++		};
++		const showSwipePopover = (text: string) => {
++			const root = document.documentElement;
++			if (!swipePopover) {
++				swipePopover = document.createElement('div');
++				swipePopover.className = 'cs-dermux-keybar-swipe-popover';
++				root.append(swipePopover);
++			}
++			swipePopover.textContent = text;
++			const buttonRect = button.getBoundingClientRect();
++			const popoverRect = swipePopover.getBoundingClientRect();
++			const targetTop = Math.max(4, Math.round(buttonRect.top - popoverRect.height - 8));
++			const unclampedLeft = Math.round(buttonRect.left + (buttonRect.width / 2) - (popoverRect.width / 2));
++			const maxLeft = Math.max(4, window.innerWidth - popoverRect.width - 4);
++			const targetLeft = Math.min(maxLeft, Math.max(4, unclampedLeft));
++			swipePopover.style.top = `${targetTop}px`;
++			swipePopover.style.left = `${targetLeft}px`;
 +		};
 +
 +		button.addEventListener('pointerdown', event => {
@@ -567,6 +589,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			focusRestoreTarget = this.captureRestorableFocusTarget();
 +			button.setPointerCapture(event.pointerId);
 +			resetPreview();
++			hideSwipePopover();
 +		});
 +
 +		button.addEventListener('pointermove', event => {
@@ -578,8 +601,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			resetPreview();
 +			if (latestDeltaY <= -CodeServerClient.KEYBAR_SWIPE_THRESHOLD_PX && buttonConfig.up) {
 +				button.classList.add('cs-dermux-keybar-btn-swipe-up');
++				const swipeUpLabel = this.resolveActionPreviewLabel(buttonConfig.up, buttonConfig.secondaryLabel);
++				if (swipeUpLabel) {
++					showSwipePopover(swipeUpLabel);
++				} else {
++					hideSwipePopover();
++				}
 +			} else if (latestDeltaY >= CodeServerClient.KEYBAR_SWIPE_THRESHOLD_PX && buttonConfig.down) {
 +				button.classList.add('cs-dermux-keybar-btn-swipe-down');
++				hideSwipePopover();
++			} else {
++				hideSwipePopover();
 +			}
 +		});
 +
@@ -590,6 +622,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +			trackingPointer = false;
 +			resetPreview();
++			hideSwipePopover();
 +			button.releasePointerCapture(pointerId);
 +
 +			const action = this.resolveButtonAction(buttonConfig, latestDeltaY);
@@ -616,6 +649,22 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		button.addEventListener('pointercancel', event => {
 +			void finalizeGesture(event.pointerId);
 +		});
++		this._register(toDisposable(() => hideSwipePopover()));
++	}
++
++	private resolveActionPreviewLabel(action: IKeybarActionConfig, fallbackLabel?: string): string | undefined {
++		if (fallbackLabel) {
++			return fallbackLabel;
++		}
++
++		if (action.type === 'key' && action.key) {
++			return action.key;
++		}
++		if (action.type === 'text' && action.text) {
++			return action.text;
++		}
++
++		return undefined;
 +	}
 +
 +	private resolveButtonAction(buttonConfig: IKeybarButtonConfig, deltaY: number): IKeybarActionConfig {
@@ -1015,12 +1064,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			: shiftActive && config.shift
 +				? config.shift
 +				: config.normal;
++		const swipeUpAction = !this.fnModeEnabled && config.fn
++			? { type: 'key' as const, key: config.fn.key, code: config.id }
++			: undefined;
 +		return {
 +			id: config.id,
 +			label: resolvedVariant.label,
 +			widthUnits: config.widthUnits,
 +			secondaryLabel: !this.fnModeEnabled && config.fn ? config.fn.label : undefined,
 +			tap: { type: 'key', key: resolvedVariant.key, code: config.id },
++			up: swipeUpAction,
 +		};
 +	}
 +
@@ -1046,12 +1099,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +
 +		const outputKey = shouldApplyLetterCase ? this.normalizeLetterKey(resolvedVariant.key) : resolvedVariant.key;
++		const swipeUpAction = !this.fnModeEnabled && config.fn
++			? { type: 'key' as const, key: config.fn.key, code: config.id }
++			: undefined;
 +		return {
 +			id: config.id,
 +			label: resolvedVariant.label,
 +			widthUnits: config.widthUnits,
 +			secondaryLabel: !this.fnModeEnabled && config.fn ? config.fn.label : undefined,
 +			tap: { type: 'key', key: outputKey, code: config.id },
++			up: swipeUpAction,
 +		};
 +	}
 +
@@ -1484,7 +1541,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -282,13 +1565,12 @@ export class CodeServerClient extends Di
+@@ -282,13 +1622,12 @@ export class CodeServerClient extends Di
  		}
  
  		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
@@ -1501,7 +1558,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1581,79 @@ export class CodeServerClient extends Di
+@@ -299,7 +1638,79 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1641,7 +1698,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	display: flex;
  	flex-direction: column;
  	gap: 6px;
-@@ -34,22 +50,63 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -34,22 +50,81 @@ body.cs-dermux-keybar-enabled .monaco-wo
  
  .cs-dermux-keybar-row {
  	display: grid;
@@ -1696,6 +1753,24 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 +	text-align: center;
 +}
 +
++.cs-dermux-keybar-swipe-popover {
++	position: fixed;
++	min-width: 24px;
++	padding: 3px 8px;
++	border: 1px solid #8a8a8a;
++	border-radius: 6px;
++	background: #d8d8d8;
++	color: #111111;
++	font-size: 12px;
++	font-weight: 700;
++	line-height: 1;
++	text-align: center;
++	pointer-events: none;
++	white-space: nowrap;
++	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
++	z-index: 2147483647;
++}
++
 +.cs-dermux-keybar-btn.cs-dermux-keybar-btn-placeholder {
 +	border-style: dashed;
 +	opacity: 0.35;
@@ -1709,7 +1784,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  .cs-dermux-keybar-btn:active {
  	transform: translateY(1px);
  }
-@@ -62,21 +119,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -62,21 +137,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
  	border-color: var(--vscode-charts-yellow);
  }
  
