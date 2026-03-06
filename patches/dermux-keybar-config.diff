@@ -1959,3 +1959,85 @@ Index: code-server/lib/vscode/src/vs/editor/browser/controller/editContext/textA
  		}
  	}
  
+Index: code-server/lib/vscode/src/vs/base/browser/dom.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/base/browser/dom.ts
++++ code-server/lib/vscode/src/vs/base/browser/dom.ts
+@@ -606,42 +606,54 @@ export function getComputedStyle(el: HTM
+ 	return getWindow(el).getComputedStyle(el, null);
+ }
+ 
+-export function getClientArea(element: HTMLElement, defaultValue?: Dimension, fallbackElement?: HTMLElement): Dimension {
+-	const elWindow = getWindow(element);
+-	const elDocument = elWindow.document;
+-	const withDermuxKeybarInset = (dimension: Dimension): Dimension => {
+-		const keybarHeightRaw = elWindow.getComputedStyle(elDocument.documentElement).getPropertyValue('--cs-dermux-keybar-height');
+-		const keybarHeight = Number.parseFloat(keybarHeightRaw);
+-		if (!Number.isFinite(keybarHeight) || keybarHeight <= 0) {
+-			return dimension;
+-		}
++function withDermuxKeybarInset(targetWindow: Window, dimension: Dimension): Dimension {
++	const keybarHeightRaw = targetWindow.getComputedStyle(targetWindow.document.documentElement).getPropertyValue('--cs-dermux-keybar-height');
++	const keybarHeight = Number.parseFloat(keybarHeightRaw);
++	if (!Number.isFinite(keybarHeight) || keybarHeight <= 0) {
++		return dimension;
++	}
+ 
+-		return new Dimension(dimension.width, Math.max(0, dimension.height - keybarHeight));
+-	};
++	return new Dimension(dimension.width, Math.max(0, dimension.height - keybarHeight));
++}
+ 
+-	// Try with DOM clientWidth / clientHeight
+-	if (element !== elDocument.body) {
+-		return new Dimension(element.clientWidth, element.clientHeight);
+-	}
++export function getWindowViewportSize(targetWindow: Window): Dimension {
++	const targetDocument = targetWindow.document;
+ 
+ 	// On mobile virtual keyboards, visual viewport reflects the visible area better than layout viewport.
+-	if ((platform.isIOS || platform.isAndroid) && elWindow?.visualViewport) {
+-		return withDermuxKeybarInset(new Dimension(elWindow.visualViewport.width, elWindow.visualViewport.height));
++	if ((platform.isIOS || platform.isAndroid) && targetWindow?.visualViewport) {
++		return withDermuxKeybarInset(targetWindow, new Dimension(targetWindow.visualViewport.width, targetWindow.visualViewport.height));
+ 	}
+ 
+ 	// Try innerWidth / innerHeight
+-	if (elWindow?.innerWidth && elWindow.innerHeight) {
+-		return withDermuxKeybarInset(new Dimension(elWindow.innerWidth, elWindow.innerHeight));
++	if (targetWindow?.innerWidth && targetWindow.innerHeight) {
++		return withDermuxKeybarInset(targetWindow, new Dimension(targetWindow.innerWidth, targetWindow.innerHeight));
+ 	}
+ 
+ 	// Try with document.body.clientWidth / document.body.clientHeight
+-	if (elDocument.body && elDocument.body.clientWidth && elDocument.body.clientHeight) {
+-		return withDermuxKeybarInset(new Dimension(elDocument.body.clientWidth, elDocument.body.clientHeight));
++	if (targetDocument.body && targetDocument.body.clientWidth && targetDocument.body.clientHeight) {
++		return withDermuxKeybarInset(targetWindow, new Dimension(targetDocument.body.clientWidth, targetDocument.body.clientHeight));
+ 	}
+ 
+ 	// Try with document.documentElement.clientWidth / document.documentElement.clientHeight
+-	if (elDocument.documentElement && elDocument.documentElement.clientWidth && elDocument.documentElement.clientHeight) {
+-		return withDermuxKeybarInset(new Dimension(elDocument.documentElement.clientWidth, elDocument.documentElement.clientHeight));
++	if (targetDocument.documentElement && targetDocument.documentElement.clientWidth && targetDocument.documentElement.clientHeight) {
++		return withDermuxKeybarInset(targetWindow, new Dimension(targetDocument.documentElement.clientWidth, targetDocument.documentElement.clientHeight));
++	}
++
++	return withDermuxKeybarInset(targetWindow, Dimension.None);
++}
++
++export function getClientArea(element: HTMLElement, defaultValue?: Dimension, fallbackElement?: HTMLElement): Dimension {
++	const elWindow = getWindow(element);
++	const elDocument = elWindow.document;
++
++	// Try with DOM clientWidth / clientHeight
++	if (element !== elDocument.body) {
++		return new Dimension(element.clientWidth, element.clientHeight);
++	}
++
++	const viewportSize = getWindowViewportSize(elWindow);
++	if (viewportSize.width > 0 && viewportSize.height > 0) {
++		return viewportSize;
+ 	}
+ 
+ 	if (fallbackElement) {
