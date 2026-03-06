@@ -434,7 +434,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,48 +524,1170 @@ export class CodeServerClient extends Di
+@@ -247,48 +524,1162 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -466,9 +466,8 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		this.updateKeyboardOverlapInset();
  		this.setKeybarVisibility();
 +		setTimeout(() => this.applyWorkbenchBottomInset(), 0);
- 	}
- 
--	private createKeybarRow(labels: string[]): HTMLDivElement {
++	}
++
 +	private getCurrentKeybarRoot(): HTMLElement {
 +		const fullscreenElement = (document.fullscreenElement
 +			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
@@ -478,21 +477,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
 +		const root = this.getCurrentKeybarRoot();
 +		root.append(keybar, handle);
-+	}
-+
+ 	}
+ 
+-	private createKeybarRow(labels: string[]): HTMLDivElement {
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
-+		const totalQuarterUnits = Math.max(
-+			1,
-+			Math.round(
-+				buttons.reduce((sum, buttonConfig) => {
-+					const widthUnits = buttonConfig.widthUnits ?? 1;
-+					return sum + widthUnits;
-+				}, 0) * 4,
-+			),
-+		);
-+		row.style.gridTemplateColumns = `repeat(${totalQuarterUnits}, minmax(0, 1fr))`;
  
 -		for (const label of labels) {
 +		for (const buttonConfig of buttons) {
@@ -504,8 +494,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 -				this.logService.debug(`[Dermux Keybar] tapped "${label}"`);
 -			});
 +			button.tabIndex = -1;
++			button.dataset.csKeybarId = buttonConfig.id;
 +			const widthUnits = Math.max(0.25, buttonConfig.widthUnits ?? 1);
-+			button.style.gridColumn = `span ${Math.max(1, Math.round(widthUnits * 4))}`;
++			button.style.flex = `${widthUnits} 1 0`;
 +			const label = document.createElement('span');
 +			label.className = 'cs-dermux-keybar-btn-label';
 +			label.textContent = buttonConfig.label;
@@ -1609,6 +1600,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		if (this.keybarVisible) {
 -			const keybarHeight = `${Math.ceil(keybar.getBoundingClientRect().height)}px`;
 -			document.documentElement.style.setProperty('--cs-dermux-keybar-height', keybarHeight);
++			this.alignArrowClusterWidths();
 +			this.setKeybarHeight(Math.ceil(keybar.getBoundingClientRect().height));
  		} else {
 -			this.clearKeybarInset();
@@ -1616,7 +1608,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1698,79 @@ export class CodeServerClient extends Di
+@@ -299,7 +1690,103 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1664,6 +1656,30 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		this.applyWorkbenchBottomInset();
 +	}
 +
++	private alignArrowClusterWidths(): void {
++		const rowsContainer = this.keybarRowsContainer;
++		if (!rowsContainer) {
++			return;
++		}
++
++		const arrowUp = rowsContainer.querySelector<HTMLButtonElement>('.cs-dermux-keybar-btn[data-cs-keybar-id="ArrowUp"]');
++		const arrowLeft = rowsContainer.querySelector<HTMLButtonElement>('.cs-dermux-keybar-btn[data-cs-keybar-id="ArrowLeft"]');
++		const arrowDown = rowsContainer.querySelector<HTMLButtonElement>('.cs-dermux-keybar-btn[data-cs-keybar-id="ArrowDown"]');
++		const arrowRight = rowsContainer.querySelector<HTMLButtonElement>('.cs-dermux-keybar-btn[data-cs-keybar-id="ArrowRight"]');
++		if (!arrowUp || !arrowLeft || !arrowDown || !arrowRight) {
++			return;
++		}
++
++		const arrowWidthPx = Math.round(arrowUp.getBoundingClientRect().width);
++		if (arrowWidthPx <= 0) {
++			return;
++		}
++
++		for (const arrowButton of [arrowLeft, arrowDown, arrowRight]) {
++			arrowButton.style.flex = `0 0 ${arrowWidthPx}px`;
++		}
++	}
++
 +	private applyWorkbenchBottomInset(): void {
 +		const workbenchRoot = document.querySelector('.monaco-workbench');
 +		const targetElement = workbenchRoot instanceof HTMLElement ? workbenchRoot : document.body;
@@ -1702,18 +1718,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
 +++ code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.css
-@@ -1,28 +1,44 @@
+@@ -1,31 +1,49 @@
  :root {
  	--cs-dermux-keybar-height: 0px;
 +	--cs-dermux-keyboard-overlap: 0px;
  	--cs-dermux-safe-area-bottom: env(safe-area-inset-bottom, 0px);
- }
- 
+-}
+-
 -body.cs-dermux-keybar-enabled .monaco-workbench {
 -	padding-bottom: calc(var(--cs-dermux-keybar-height) + var(--cs-dermux-safe-area-bottom));
 -	box-sizing: border-box;
--}
--
++	--cs-dermux-keybar-gap: 6px;
+ }
+ 
  .cs-dermux-keybar {
  	position: fixed;
  	left: 0;
@@ -1730,11 +1747,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 +	contain: paint;
  	display: flex;
  	flex-direction: column;
- 	gap: 6px;
- 	padding: 8px 8px calc(8px + var(--cs-dermux-safe-area-bottom));
+-	gap: 6px;
+-	padding: 8px 8px calc(8px + var(--cs-dermux-safe-area-bottom));
 -	background: color-mix(in srgb, var(--vscode-editor-background) 92%, black);
 -	border-top: 1px solid var(--vscode-widget-border);
 -	z-index: 1700;
++	gap: var(--cs-dermux-keybar-gap);
++	padding: var(--cs-dermux-keybar-gap);
++	padding-bottom: calc(var(--cs-dermux-keybar-gap) + var(--cs-dermux-safe-area-bottom));
 +	background: #000000 !important;
 +	border-top: 1px solid #3a3a3a;
 +	z-index: 2147483645;
@@ -1755,23 +1775,33 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 +	z-index: 1;
  	display: flex;
  	flex-direction: column;
- 	gap: 6px;
-@@ -34,22 +50,81 @@ body.cs-dermux-keybar-enabled .monaco-wo
+-	gap: 6px;
++	gap: var(--cs-dermux-keybar-gap);
+ }
+ 
+ .cs-dermux-keybar.cs-dermux-keybar-hidden {
+@@ -33,23 +51,84 @@ body.cs-dermux-keybar-enabled .monaco-wo
+ }
  
  .cs-dermux-keybar-row {
- 	display: grid;
+-	display: grid;
 -	grid-template-columns: repeat(6, minmax(0, 1fr));
- 	gap: 6px;
+-	gap: 6px;
++	display: flex;
++	gap: var(--cs-dermux-keybar-gap);
++	width: 100%;
  }
  
  .cs-dermux-keybar-btn {
++	flex: 1 1 0;
 +	position: relative;
 +	display: flex;
 +	align-items: center;
 +	justify-content: center;
  	height: 40px;
- 	min-width: 40px;
+-	min-width: 40px;
 -	border: 1px solid var(--vscode-widget-border);
++	min-width: 0;
 +	padding: 0 6px;
 +	border: 1px solid #505050;
  	border-radius: 6px;
@@ -1842,7 +1872,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  .cs-dermux-keybar-btn:active {
  	transform: translateY(1px);
  }
-@@ -62,21 +137,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -62,21 +141,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
  	border-color: var(--vscode-charts-yellow);
  }
  
