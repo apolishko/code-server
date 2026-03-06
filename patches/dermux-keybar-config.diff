@@ -51,7 +51,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
-@@ -1,28 +1,102 @@
+@@ -1,28 +1,103 @@
  import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
 -import { isMobile } from '../../base/common/platform.js';
 +import { IME } from '../../base/common/ime.js';
@@ -139,6 +139,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private fnModeEnabled = false;
 +	private capsLockEnabled = false;
 +	private nativeImeEnabled = false;
++	private keybarActionFocusTarget: HTMLElement | undefined;
 +	private readonly modifierButtonByKind = new Map<KeybarModifier, Set<HTMLButtonElement>>();
 +	private readonly modifierState: Record<KeybarModifier, KeybarModifierState> = {
 +		ctrl: 'off',
@@ -156,7 +157,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	) {
  		super();
  	}
-@@ -99,10 +173,16 @@ export class CodeServerClient extends Di
+@@ -99,10 +174,16 @@ export class CodeServerClient extends Di
  		}
  
  		if (this.productService.serviceWorker) {
@@ -175,7 +176,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.createBottomKeybarSkeleton();
  	}
  
-@@ -190,24 +270,210 @@ export class CodeServerClient extends Di
+@@ -190,24 +271,210 @@ export class CodeServerClient extends Di
  		}
  	}
  
@@ -388,7 +389,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			return;
  		}
  
-@@ -215,30 +481,41 @@ export class CodeServerClient extends Di
+@@ -215,30 +482,41 @@ export class CodeServerClient extends Di
  		if (!body) {
  			return;
  		}
@@ -437,7 +438,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +524,912 @@ export class CodeServerClient extends Di
+@@ -247,33 +525,1038 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -448,13 +449,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +		}));
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -503,6 +504,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				secondaryLabel.className = 'cs-dermux-keybar-btn-secondary-label';
 +				secondaryLabel.textContent = buttonConfig.secondaryLabel;
 +				button.append(secondaryLabel);
++			}
++			if (this.isArrowNavigationButton(buttonConfig.id)) {
++				button.classList.add('cs-dermux-keybar-btn-arrow');
 +			}
 +
 +			if (this.isSpacerButton(buttonConfig)) {
@@ -590,11 +594,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +			const action = this.resolveButtonAction(buttonConfig, latestDeltaY);
 +			if (this.tryHandleToggleButton(buttonConfig, action)) {
++				this.keybarActionFocusTarget = undefined;
 +				this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
 +				return;
 +			}
 +			const shouldRestoreFocus = this.shouldRestoreFocusAfterAction(action);
-+			await this.dispatchKeybarAction(action);
++			this.keybarActionFocusTarget = focusRestoreTarget;
++			try {
++				await this.dispatchKeybarAction(action);
++			} finally {
++				this.keybarActionFocusTarget = undefined;
++			}
 +			if (shouldRestoreFocus) {
 +				this.restoreFocusAfterKeybarInteraction(focusRestoreTarget);
 +			}
@@ -620,16 +630,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +	private toModifierKind(buttonId: string): KeybarModifier | undefined {
 +		const normalizedId = buttonId.toLowerCase();
-+		if (normalizedId.includes('ctrl') || normalizedId.includes('control')) {
++		if (normalizedId === 'ctrl' || normalizedId === 'control' || normalizedId === 'ctrlleft' || normalizedId === 'ctrlright' || normalizedId === 'controlleft' || normalizedId === 'controlright') {
 +			return 'ctrl';
 +		}
-+		if (normalizedId.includes('alt')) {
++		if (normalizedId === 'alt' || normalizedId === 'altleft' || normalizedId === 'altright') {
 +			return 'alt';
 +		}
-+		if (normalizedId.includes('shift')) {
++		if (normalizedId === 'shift' || normalizedId === 'shiftleft' || normalizedId === 'shiftright') {
 +			return 'shift';
 +		}
-+		if (normalizedId.includes('meta') || normalizedId.includes('cmd') || normalizedId.includes('win')) {
++		if (normalizedId === 'meta' || normalizedId === 'metaleft' || normalizedId === 'metaright' || normalizedId === 'cmd' || normalizedId === 'cmdleft' || normalizedId === 'cmdright' || normalizedId === 'win' || normalizedId === 'winleft' || normalizedId === 'winright') {
 +			return 'meta';
 +		}
 +		return undefined;
@@ -645,6 +655,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +	private isLanguageToggleButton(buttonId: string): boolean {
 +		return buttonId.toLowerCase() === 'langswitch';
++	}
++
++	private isArrowNavigationButton(buttonId: string): boolean {
++		const normalizedId = buttonId.toLowerCase();
++		return normalizedId === 'arrowup' || normalizedId === 'arrowdown' || normalizedId === 'arrowleft' || normalizedId === 'arrowright';
 +	}
 +
 +	private isSpacerButton(buttonConfig: IKeybarButtonConfig): boolean {
@@ -678,7 +693,11 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			}
 +
 +			this.modifierState[modifierKind] = nextState;
-+			this.renderModifierButtons();
++			if (modifierKind === 'shift') {
++				void this.reloadKeybarConfig(false);
++			} else {
++				this.renderModifierButtons();
++			}
 +			return true;
 +		}
 +
@@ -718,7 +737,6 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				this.createFixedKeyButton('F10', 'F10', 'F10', 1),
 +				this.createFixedKeyButton('F11', 'F11', 'F11', 1),
 +				this.createFixedKeyButton('F12', 'F12', 'F12', 1),
-+				this.createPlaceholderButton('User1', '[U1]', 1),
 +				this.createFixedKeyButton('Insert', 'Ins', 'Insert', 1),
 +				this.createFixedKeyButton('Delete', 'Del', 'Delete', 1),
 +			],
@@ -922,14 +940,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +					normal: { label: '↑', key: 'ArrowUp' },
 +					fn: { label: 'PgUp', key: 'PageUp' },
 +				}),
-+				this.createPlaceholderButton('ShiftRowPlaceholder', '', 1.75),
++				this.createPlaceholderButton('ReservedRightPlaceholder', '', 1),
 +			],
 +			[
 +				this.createModifierButton('CtrlLeft', 'Ctrl', 1.25),
 +				this.createToggleButton('Fn', this.fnModeEnabled ? 'Fn●' : 'Fn', 1.25),
 +				this.createToggleButton('LangSwitch', this.keybarLayout.toUpperCase(), 1.25),
 +				this.createModifierButton('AltLeft', 'Alt', 1.25),
-+				this.createFixedKeyButton('Space', '', ' ', 6.25),
++				this.createFixedKeyButton('Space', '', ' ', 6),
 +				this.createModifierButton('AltRight', 'Alt', 1.25),
 +				this.createModifierButton('CtrlRight', 'Ctrl', 1.25),
 +				this.createShiftFnKeyButton({
@@ -946,7 +964,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				}),
 +				this.createShiftFnKeyButton({
 +					id: 'ArrowRight',
-+					widthUnits: 1,
++					widthUnits: 1.25,
 +					normal: { label: '→', key: 'ArrowRight' },
 +					fn: { label: 'End', key: 'End' },
 +				}),
@@ -991,7 +1009,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	}
 +
 +	private createShiftFnKeyButton(config: IKeybarShiftFnKeyConfig): IKeybarButtonConfig {
-+		const shiftActive = this.modifierState.shift !== 'off';
++		const shiftActive = this.isShiftLayoutActive();
 +		const resolvedVariant = this.fnModeEnabled && config.fn
 +			? config.fn
 +			: shiftActive && config.shift
@@ -1007,7 +1025,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	}
 +
 +	private createLocalizedKeyButton(config: IKeybarLocalizedKeyConfig): IKeybarButtonConfig {
-+		const shiftActive = this.modifierState.shift !== 'off';
++		const shiftActive = this.isShiftLayoutActive();
 +		let resolvedVariant: IKeybarCharacterVariant;
 +		let shouldApplyLetterCase = false;
 +
@@ -1045,8 +1063,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	}
 +
 +	private shouldUppercaseLetters(): boolean {
-+		const shiftActive = this.modifierState.shift !== 'off';
++		const shiftActive = this.isShiftLayoutActive();
 +		return shiftActive !== this.capsLockEnabled;
++	}
++
++	private isShiftLayoutActive(): boolean {
++		return this.modifierState.shift !== 'off' && !this.hasNonShiftModifiersActive();
++	}
++
++	private hasNonShiftModifiersActive(): boolean {
++		return this.modifierState.ctrl !== 'off' || this.modifierState.alt !== 'off' || this.modifierState.meta !== 'off';
 +	}
 +
 +	private isLetterCharacter(key: string): boolean {
@@ -1075,6 +1101,18 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +	}
 +
++	private isKeybarElement(target: HTMLElement): boolean {
++		return Boolean(this.keybarContainer?.contains(target) || this.keybarHandle?.contains(target));
++	}
++
++	private ensureActionTargetFocus(): void {
++		const activeElement = document.activeElement;
++		if (activeElement instanceof HTMLElement && !this.isKeybarElement(activeElement)) {
++			return;
++		}
++		this.restoreFocusAfterKeybarInteraction(this.keybarActionFocusTarget);
++	}
++
 +	private shouldRestoreFocusAfterAction(action: IKeybarActionConfig): boolean {
 +		// Command actions can move focus intentionally (quick pick, palette, dialogs).
 +		// Do not force focus back after running them.
@@ -1085,6 +1123,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		if (action.type === 'key') {
 +			const modifiers = this.getActiveModifierFlags(action);
 +			if (modifiers.ctrl || modifiers.alt || modifiers.meta) {
++				return false;
++			}
++			if (action.key && action.key.length !== 1) {
 +				return false;
 +			}
 +		}
@@ -1104,13 +1145,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +	private consumeLatchedModifiers(): void {
 +		let didChange = false;
++		let didShiftStateChange = false;
 +		for (const modifierKind of Object.keys(this.modifierState) as KeybarModifier[]) {
 +			if (this.modifierState[modifierKind] === 'latched') {
 +				this.modifierState[modifierKind] = 'off';
 +				didChange = true;
++				if (modifierKind === 'shift') {
++					didShiftStateChange = true;
++				}
 +			}
 +		}
-+		if (didChange) {
++		if (didShiftStateChange) {
++			void this.reloadKeybarConfig(false);
++		} else if (didChange) {
 +			this.renderModifierButtons();
 +		}
 +	}
@@ -1167,6 +1214,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			if (!action.text) {
 +				return this.finishNonModifierAction(false);
 +			}
++			this.ensureActionTargetFocus();
 +			const didInsert = this.insertText(action.text);
 +			return this.finishNonModifierAction(didInsert);
 +		}
@@ -1175,9 +1223,20 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			if (!action.key) {
 +				return this.finishNonModifierAction(false);
 +			}
++			this.ensureActionTargetFocus();
 +			const modifiers = this.getActiveModifierFlags(action);
 +			const activeEditable = this.getActiveEditableElement();
 +			const hasHardModifiers = modifiers.ctrl || modifiers.alt || modifiers.meta;
++			if (action.key === 'Enter' && !hasHardModifiers) {
++				const focusTarget = this.keybarActionFocusTarget
++					?? (document.activeElement instanceof HTMLElement ? document.activeElement : undefined);
++				if (this.isEditorInputTarget(focusTarget)) {
++					const didInsertLineBreak = await this.typeText('\n');
++					if (didInsertLineBreak) {
++						return this.finishNonModifierAction(true);
++					}
++				}
++			}
 +			if (activeEditable && this.shouldUseDomInsertion(activeEditable) && !hasHardModifiers) {
 +				const didHandleEditingKey = this.applyEditingKeyToEditable(action.key, activeEditable);
 +				if (didHandleEditingKey) {
@@ -1289,6 +1348,22 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return true;
 +	}
 +
++	private isEditorInputTarget(element: HTMLElement | undefined): boolean {
++		if (!element) {
++			return false;
++		}
++
++		if (element.classList.contains('inputarea') || element.classList.contains('ime-text-area') || element.classList.contains('native-edit-context')) {
++			return true;
++		}
++
++		if (element.getAttribute('aria-roledescription') === 'editor') {
++			return true;
++		}
++
++		return Boolean(element.closest('.monaco-editor'));
++	}
++
 +	private insertText(text: string, targetElement?: HTMLElement): boolean {
 +		const target = targetElement ?? this.getActiveEditableElement();
 +		if (!target) {
@@ -1324,13 +1399,24 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +	private dispatchSyntheticKey(action: IKeybarActionConfig): boolean {
 +		const activeElement = document.activeElement;
-+		const target = activeElement instanceof HTMLElement ? activeElement : document.body;
++		let target = activeElement instanceof HTMLElement ? activeElement : undefined;
++		if (target && this.isKeybarElement(target)) {
++			target = this.keybarActionFocusTarget;
++		}
++		if (!target) {
++			target = this.keybarActionFocusTarget ?? document.body;
++		}
++		if (target instanceof HTMLElement && target !== document.activeElement) {
++			this.restoreFocusAfterKeybarInteraction(target);
++		}
 +		const key = action.key!;
 +		const modifiers = this.getActiveModifierFlags(action);
++		const code = action.code ?? this.toKeyboardCode(key);
++		const legacyKeyCode = this.toLegacyKeyCode(key, code);
 +
-+		const eventInit: KeyboardEventInit = {
++		const eventInit: KeyboardEventInit & { keyCode?: number; which?: number; charCode?: number } = {
 +			key,
-+			code: action.code ?? this.toKeyboardCode(key),
++			code,
 +			ctrlKey: modifiers.ctrl,
 +			altKey: modifiers.alt,
 +			shiftKey: modifiers.shift,
@@ -1338,6 +1424,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			bubbles: true,
 +			cancelable: true,
 +		};
++		if (legacyKeyCode !== undefined) {
++			eventInit.keyCode = legacyKeyCode;
++			eventInit.which = legacyKeyCode;
++		}
++		if (key.length === 1) {
++			eventInit.charCode = key.charCodeAt(0);
++		}
 +
 +		const didDispatch = target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
 +		target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
@@ -1354,10 +1447,44 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return key;
 +	}
 +
++	private toLegacyKeyCode(key: string, code: string): number | undefined {
++		const functionMatch = /^F([1-9]|1[0-2])$/.exec(key);
++		if (functionMatch) {
++			return 111 + Number(functionMatch[1]);
++		}
++
++		if (code.length === 4 && code.startsWith('Key')) {
++			return code.charCodeAt(3);
++		}
++		if (code.length === 6 && code.startsWith('Digit')) {
++			return code.charCodeAt(5);
++		}
++
++		switch (key) {
++			case 'Backspace': return 8;
++			case 'Tab': return 9;
++			case 'Enter': return 13;
++			case 'Escape': return 27;
++			case ' ': return 32;
++			case 'PageUp': return 33;
++			case 'PageDown': return 34;
++			case 'End': return 35;
++			case 'Home': return 36;
++			case 'ArrowLeft': return 37;
++			case 'ArrowUp': return 38;
++			case 'ArrowRight': return 39;
++			case 'ArrowDown': return 40;
++			case 'Insert': return 45;
++			case 'Delete': return 46;
++		}
++
++		return undefined;
++	}
++
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -282,13 +1438,12 @@ export class CodeServerClient extends Di
+@@ -282,13 +1565,12 @@ export class CodeServerClient extends Di
  		}
  
  		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
@@ -1374,7 +1501,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1454,79 @@ export class CodeServerClient extends Di
+@@ -299,7 +1581,79 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1514,7 +1641,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  	display: flex;
  	flex-direction: column;
  	gap: 6px;
-@@ -34,22 +50,56 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -34,22 +50,63 @@ body.cs-dermux-keybar-enabled .monaco-wo
  
  .cs-dermux-keybar-row {
  	display: grid;
@@ -1562,6 +1689,13 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 +	pointer-events: none;
 +}
 +
++.cs-dermux-keybar-btn.cs-dermux-keybar-btn-arrow .cs-dermux-keybar-btn-secondary-label {
++	left: 50%;
++	right: auto;
++	transform: translateX(-50%);
++	text-align: center;
++}
++
 +.cs-dermux-keybar-btn.cs-dermux-keybar-btn-placeholder {
 +	border-style: dashed;
 +	opacity: 0.35;
@@ -1575,7 +1709,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  .cs-dermux-keybar-btn:active {
  	transform: translateY(1px);
  }
-@@ -62,21 +112,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -62,21 +119,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
  	border-color: var(--vscode-charts-yellow);
  }
  
