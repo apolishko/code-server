@@ -434,7 +434,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,48 +524,1127 @@ export class CodeServerClient extends Di
+@@ -247,48 +524,1170 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -447,15 +447,15 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
 +		document.addEventListener('fullscreenchange', viewportListener);
 +		document.addEventListener('webkitfullscreenchange', viewportListener as EventListener);
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +			document.removeEventListener('fullscreenchange', viewportListener);
 +			document.removeEventListener('webkitfullscreenchange', viewportListener as EventListener);
 +		}));
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -466,8 +466,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		this.updateKeyboardOverlapInset();
  		this.setKeybarVisibility();
 +		setTimeout(() => this.applyWorkbenchBottomInset(), 0);
-+	}
-+
+ 	}
+ 
+-	private createKeybarRow(labels: string[]): HTMLDivElement {
 +	private getCurrentKeybarRoot(): HTMLElement {
 +		const fullscreenElement = (document.fullscreenElement
 +			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
@@ -477,9 +478,8 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
 +		const root = this.getCurrentKeybarRoot();
 +		root.append(keybar, handle);
- 	}
- 
--	private createKeybarRow(labels: string[]): HTMLDivElement {
++	}
++
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
@@ -1297,6 +1297,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			const modifiers = this.getActiveModifierFlags(action);
 +			const activeEditable = this.getActiveEditableElement();
 +			const hasHardModifiers = modifiers.ctrl || modifiers.alt || modifiers.meta;
++			const clipboardShortcutResult = await this.tryDispatchEditorClipboardShortcut(action, modifiers);
++			if (clipboardShortcutResult !== undefined) {
++				return this.finishNonModifierAction(clipboardShortcutResult);
++			}
 +			if (action.key === 'Enter' && !hasHardModifiers) {
 +				const focusTarget = this.keybarActionFocusTarget
 +					?? (document.activeElement instanceof HTMLElement ? document.activeElement : undefined);
@@ -1323,6 +1327,45 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +
 +		return false;
++	}
++
++	private async tryDispatchEditorClipboardShortcut(
++		action: IKeybarActionConfig,
++		modifiers: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean },
++	): Promise<boolean | undefined> {
++		if (!modifiers.ctrl || modifiers.alt || modifiers.meta || modifiers.shift) {
++			return undefined;
++		}
++
++		const keyCode = (action.code ?? this.toKeyboardCode(action.key ?? '')).toUpperCase();
++		let commandId: string | undefined;
++		switch (keyCode) {
++			case 'KEYC':
++				commandId = 'editor.action.clipboardCopyAction';
++				break;
++			case 'KEYX':
++				commandId = 'editor.action.clipboardCutAction';
++				break;
++			case 'KEYV':
++				commandId = 'editor.action.clipboardPasteAction';
++				break;
++			default:
++				return undefined;
++		}
++
++		const focusTarget = this.keybarActionFocusTarget
++			?? (document.activeElement instanceof HTMLElement ? document.activeElement : undefined);
++		if (!this.isEditorInputTarget(focusTarget)) {
++			return undefined;
++		}
++
++		try {
++			await this.commandService.executeCommand(commandId);
++			return true;
++		} catch (error) {
++			this.logService.warn(`[Dermux Keybar] clipboard command failed "${commandId}": ${String(error)}`);
++			return false;
++		}
 +	}
 +
 +	private finishNonModifierAction(result: boolean): boolean {
@@ -1573,7 +1616,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1655,79 @@ export class CodeServerClient extends Di
+@@ -299,7 +1698,79 @@ export class CodeServerClient extends Di
  		);
  	}
  
