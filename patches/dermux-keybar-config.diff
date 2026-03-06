@@ -389,11 +389,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			return;
  		}
  
-@@ -215,30 +482,41 @@ export class CodeServerClient extends Di
- 		if (!body) {
- 			return;
- 		}
-+		const root = document.documentElement;
+@@ -218,27 +485,37 @@ export class CodeServerClient extends Di
  
  		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
  		this.keybarVisible = storedVisibility ?? true;
@@ -431,14 +427,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  
  		body.classList.add('cs-dermux-keybar-enabled');
 -		body.append(keybar, handle);
-+		root.append(keybar, handle);
++		this.appendKeybarToCurrentRoot(keybar, handle);
  
  		this.keybarContainer = keybar;
 +		this.keybarRowsContainer = rowsContainer;
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,33 +525,1095 @@ export class CodeServerClient extends Di
+@@ -247,48 +524,1127 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -449,13 +445,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('resize', viewportListener);
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
-+		this._register(toDisposable(() => {
++		document.addEventListener('fullscreenchange', viewportListener);
++		document.addEventListener('webkitfullscreenchange', viewportListener as EventListener);
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
++			document.removeEventListener('fullscreenchange', viewportListener);
++			document.removeEventListener('webkitfullscreenchange', viewportListener as EventListener);
 +		}));
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -466,6 +466,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		this.updateKeyboardOverlapInset();
  		this.setKeybarVisibility();
 +		setTimeout(() => this.applyWorkbenchBottomInset(), 0);
++	}
++
++	private getCurrentKeybarRoot(): HTMLElement {
++		const fullscreenElement = (document.fullscreenElement
++			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
++		return fullscreenElement instanceof HTMLElement ? fullscreenElement : document.documentElement;
++	}
++
++	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
++		const root = this.getCurrentKeybarRoot();
++		root.append(keybar, handle);
  	}
  
 -	private createKeybarRow(labels: string[]): HTMLDivElement {
@@ -564,10 +575,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			swipePopover = undefined;
 +		};
 +		const showSwipePopover = (text: string) => {
-+			const root = document.documentElement;
++			const root = this.getCurrentKeybarRoot();
 +			if (!swipePopover) {
 +				swipePopover = document.createElement('div');
 +				swipePopover.className = 'cs-dermux-keybar-swipe-popover';
++				root.append(swipePopover);
++			} else if (swipePopover.parentElement !== root) {
 +				root.append(swipePopover);
 +			}
 +			swipePopover.textContent = text;
@@ -1541,8 +1554,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	private setKeybarVisibility(): void {
  		const keybar = this.keybarContainer;
  		const handle = this.keybarHandle;
-@@ -282,13 +1622,12 @@ export class CodeServerClient extends Di
+ 		if (!keybar || !handle) {
+ 			return;
  		}
++		this.appendKeybarToCurrentRoot(keybar, handle);
  
  		keybar.classList.toggle('cs-dermux-keybar-hidden', !this.keybarVisible);
 -		handle.classList.toggle('cs-dermux-keybar-handle-hidden', this.keybarVisible);
@@ -1558,7 +1573,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1638,79 @@ export class CodeServerClient extends Di
+@@ -299,7 +1655,79 @@ export class CodeServerClient extends Di
  		);
  	}
  
