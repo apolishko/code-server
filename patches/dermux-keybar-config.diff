@@ -434,7 +434,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,48 +524,1162 @@ export class CodeServerClient extends Di
+@@ -247,48 +524,1196 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -447,15 +447,15 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
 +		document.addEventListener('fullscreenchange', viewportListener);
 +		document.addEventListener('webkitfullscreenchange', viewportListener as EventListener);
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +			document.removeEventListener('fullscreenchange', viewportListener);
 +			document.removeEventListener('webkitfullscreenchange', viewportListener as EventListener);
 +		}));
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -472,14 +472,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		const fullscreenElement = (document.fullscreenElement
 +			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
 +		return fullscreenElement instanceof HTMLElement ? fullscreenElement : document.documentElement;
-+	}
-+
-+	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
-+		const root = this.getCurrentKeybarRoot();
-+		root.append(keybar, handle);
  	}
  
 -	private createKeybarRow(labels: string[]): HTMLDivElement {
++	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
++		const root = this.getCurrentKeybarRoot();
++		root.append(keybar, handle);
++	}
++
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
@@ -1287,6 +1287,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			this.ensureActionTargetFocus();
 +			const modifiers = this.getActiveModifierFlags(action);
 +			const activeEditable = this.getActiveEditableElement();
++			const terminalFocused = this.isTerminalInputTarget(this.keybarActionFocusTarget)
++				|| this.isTerminalInputTarget(activeEditable)
++				|| this.isTerminalInputTarget(document.activeElement instanceof HTMLElement ? document.activeElement : undefined);
 +			const hasHardModifiers = modifiers.ctrl || modifiers.alt || modifiers.meta;
 +			const clipboardShortcutResult = await this.tryDispatchEditorClipboardShortcut(action, modifiers);
 +			if (clipboardShortcutResult !== undefined) {
@@ -1310,6 +1313,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			}
 +			const isPrintableCharacter = action.key.length === 1;
 +			if (isPrintableCharacter && !hasHardModifiers) {
++				if (terminalFocused) {
++					const didSendToTerminal = await this.sendSequenceToTerminal(action.key);
++					return this.finishNonModifierAction(didSendToTerminal);
++				}
 +				const didType = await this.typeText(action.key);
 +				return this.finishNonModifierAction(didType);
 +			}
@@ -1440,7 +1447,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	}
 +
 +	private shouldUseDomInsertion(element: HTMLElement): boolean {
-+		if (element.classList.contains('inputarea') || element.classList.contains('ime-text-area') || element.classList.contains('native-edit-context')) {
++		if (
++			element.classList.contains('inputarea')
++			|| element.classList.contains('ime-text-area')
++			|| element.classList.contains('native-edit-context')
++			|| element.classList.contains('xterm-helper-textarea')
++		) {
 +			return false;
 +		}
 +
@@ -1466,6 +1478,28 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +
 +		return Boolean(element.closest('.monaco-editor'));
++	}
++
++	private isTerminalInputTarget(element: HTMLElement | undefined): boolean {
++		if (!element) {
++			return false;
++		}
++
++		if (element.classList.contains('xterm-helper-textarea')) {
++			return true;
++		}
++
++		return Boolean(element.closest('.terminal-wrapper, .xterm'));
++	}
++
++	private async sendSequenceToTerminal(text: string): Promise<boolean> {
++		try {
++			await this.commandService.executeCommand('workbench.action.terminal.sendSequence', { text });
++			return true;
++		} catch (error) {
++			this.logService.warn(`[Dermux Keybar] terminal send sequence failed: ${String(error)}`);
++			return false;
++		}
 +	}
 +
 +	private insertText(text: string, targetElement?: HTMLElement): boolean {
@@ -1608,7 +1642,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1690,103 @@ export class CodeServerClient extends Di
+@@ -299,7 +1724,103 @@ export class CodeServerClient extends Di
  		);
  	}
  
