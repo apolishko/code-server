@@ -468,8 +468,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		setTimeout(() => this.applyWorkbenchBottomInset(), 0);
 +		this.installWorkbenchInsetBootstrapObserver();
 +		this.installTerminalTouchScrollBridge();
-+	}
-+
+ 	}
+ 
+-	private createKeybarRow(labels: string[]): HTMLDivElement {
 +	private getCurrentKeybarRoot(): HTMLElement {
 +		const fullscreenElement = (document.fullscreenElement
 +			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
@@ -479,9 +480,8 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
 +		const root = this.getCurrentKeybarRoot();
 +		root.append(keybar, handle);
- 	}
- 
--	private createKeybarRow(labels: string[]): HTMLDivElement {
++	}
++
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
@@ -1644,7 +1644,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1726,233 @@ export class CodeServerClient extends Di
+@@ -299,7 +1726,322 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1699,9 +1699,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +		let activeViewport: HTMLElement | undefined;
 +		let activeTouchId: number | undefined;
++		let touchStartTarget: EventTarget | null = null;
++		let touchStartTimestamp = 0;
++		let shouldEmitTapClick = false;
 +		let lastClientX = 0;
 +		let lastClientY = 0;
 +		let axisLock: 'pending' | 'vertical' | 'horizontal' = 'pending';
++		const TAP_MOVE_THRESHOLD_PX = 10;
++		const TAP_MAX_DURATION_MS = 500;
 +
 +		const findTerminalViewport = (target: EventTarget | null): HTMLElement | undefined => {
 +			if (!(target instanceof HTMLElement)) {
@@ -1715,10 +1720,70 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			return viewport ?? undefined;
 +		};
 +
++		const findTerminalElement = (target: EventTarget | null): HTMLElement | undefined => {
++			if (!(target instanceof HTMLElement)) {
++				return undefined;
++			}
++			const terminalElement = target.closest('.xterm');
++			return terminalElement instanceof HTMLElement ? terminalElement : undefined;
++		};
++
 +		const resetTouchTracking = () => {
 +			activeViewport = undefined;
 +			activeTouchId = undefined;
++			touchStartTarget = null;
++			touchStartTimestamp = 0;
++			shouldEmitTapClick = false;
 +			axisLock = 'pending';
++		};
++
++		const emitSyntheticTerminalClick = (touch: Touch) => {
++			const target = document.elementFromPoint(touch.clientX, touch.clientY);
++			if (!(target instanceof HTMLElement)) {
++				return;
++			}
++			if (!target.closest('.terminal-wrapper, .xterm')) {
++				return;
++			}
++
++			const eventInit: MouseEventInit = {
++				bubbles: true,
++				cancelable: true,
++				clientX: touch.clientX,
++				clientY: touch.clientY,
++				screenX: touch.screenX,
++				screenY: touch.screenY,
++				button: 0,
++				buttons: 1,
++				detail: 1,
++				composed: true,
++			};
++			target.dispatchEvent(new MouseEvent('mousedown', eventInit));
++			target.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
++			target.dispatchEvent(new MouseEvent('click', { ...eventInit, buttons: 0 }));
++		};
++
++		const emitSyntheticTerminalWheel = (touch: Touch, fingerDeltaY: number) => {
++			const targetAtPoint = document.elementFromPoint(touch.clientX, touch.clientY);
++			const terminalElement = findTerminalElement(targetAtPoint)
++				?? (activeViewport?.closest('.xterm') instanceof HTMLElement ? activeViewport.closest('.xterm') : undefined);
++			if (!terminalElement) {
++				return;
++			}
++
++			terminalElement.dispatchEvent(new WheelEvent('wheel', {
++				bubbles: true,
++				cancelable: true,
++				composed: true,
++				clientX: touch.clientX,
++				clientY: touch.clientY,
++				screenX: touch.screenX,
++				screenY: touch.screenY,
++				deltaX: 0,
++				// Keep the same perceived direction as viewport scrollTop -= fingerDeltaY.
++				deltaY: -fingerDeltaY,
++				deltaMode: WheelEvent.DOM_DELTA_PIXEL,
++			}));
 +		};
 +
 +		const onTouchStart = (event: TouchEvent) => {
@@ -1732,6 +1797,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			}
 +			activeViewport = viewport;
 +			activeTouchId = touch.identifier;
++			touchStartTarget = event.target;
++			touchStartTimestamp = Date.now();
++			shouldEmitTapClick = true;
 +			lastClientX = touch.clientX;
 +			lastClientY = touch.clientY;
 +			axisLock = 'pending';
@@ -1754,11 +1822,20 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				}
 +				axisLock = Math.abs(deltaY) >= Math.abs(deltaX) ? 'vertical' : 'horizontal';
 +			}
++			if (Math.abs(deltaX) > TAP_MOVE_THRESHOLD_PX || Math.abs(deltaY) > TAP_MOVE_THRESHOLD_PX) {
++				shouldEmitTapClick = false;
++			}
 +			if (axisLock !== 'vertical') {
 +				return;
 +			}
 +
++			const previousScrollTop = activeViewport.scrollTop;
 +			activeViewport.scrollTop -= deltaY;
++			const didScrollViewport = activeViewport.scrollTop !== previousScrollTop;
++			if (!didScrollViewport) {
++				emitSyntheticTerminalWheel(touch, deltaY);
++			}
++			shouldEmitTapClick = false;
 +			lastClientX = touch.clientX;
 +			lastClientY = touch.clientY;
 +			event.preventDefault();
@@ -1767,6 +1844,18 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		const onTouchEndOrCancel = (event: TouchEvent) => {
 +			if (activeTouchId === undefined) {
 +				return;
++			}
++			const changedTouch = Array.from(event.changedTouches).find(touch => touch.identifier === activeTouchId);
++			if (changedTouch && shouldEmitTapClick) {
++				const elapsedMs = Date.now() - touchStartTimestamp;
++				const deltaX = changedTouch.clientX - lastClientX;
++				const deltaY = changedTouch.clientY - lastClientY;
++				const isTap = elapsedMs <= TAP_MAX_DURATION_MS && Math.abs(deltaX) <= TAP_MOVE_THRESHOLD_PX && Math.abs(deltaY) <= TAP_MOVE_THRESHOLD_PX;
++				const startedInTerminal = touchStartTarget instanceof HTMLElement && Boolean(touchStartTarget.closest('.terminal-wrapper, .xterm'));
++				if (isTap && startedInTerminal) {
++					emitSyntheticTerminalClick(changedTouch);
++					event.preventDefault();
++				}
 +			}
 +			const touchStillActive = Array.from(event.touches).some(touch => touch.identifier === activeTouchId);
 +			if (!touchStillActive) {
@@ -2038,7 +2127,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
  .cs-dermux-keybar-btn:active {
  	transform: translateY(1px);
  }
-@@ -62,21 +141,35 @@ body.cs-dermux-keybar-enabled .monaco-wo
+@@ -62,21 +141,40 @@ body.cs-dermux-keybar-enabled .monaco-wo
  	border-color: var(--vscode-charts-yellow);
  }
  
@@ -2077,16 +2166,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/media/codeServerKeybar.cs
 +	font-size: 12px;
  	font-weight: 600;
 -	z-index: 1701;
--}
--
--.cs-dermux-keybar-handle.cs-dermux-keybar-handle-hidden {
--	display: none;
 +	opacity: 1 !important;
 +	filter: none !important;
 +	backdrop-filter: none !important;
 +	-webkit-backdrop-filter: none !important;
 +	mix-blend-mode: normal !important;
 +	z-index: 2147483646;
+ }
+ 
+-.cs-dermux-keybar-handle.cs-dermux-keybar-handle-hidden {
+-	display: none;
++body.cs-dermux-keybar-enabled .monaco-dialog-modal-block {
++	padding-bottom: calc(var(--cs-dermux-keybar-height) + var(--cs-dermux-keyboard-overlap));
++	box-sizing: border-box;
  }
 Index: code-server/lib/vscode/src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts
 ===================================================================
