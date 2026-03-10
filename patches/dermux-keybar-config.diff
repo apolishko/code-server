@@ -51,7 +51,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
-@@ -1,28 +1,103 @@
+@@ -1,28 +1,104 @@
  import { Disposable, toDisposable } from "../../base/common/lifecycle.js";
 -import { isMobile } from '../../base/common/platform.js';
 +import { IME } from '../../base/common/ime.js';
@@ -138,6 +138,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private keybarLayout: 'en' | 'ru' = 'en';
 +	private fnModeEnabled = false;
 +	private capsLockEnabled = false;
++	private selectionModeEnabled = false;
 +	private nativeImeEnabled = false;
 +	private keybarActionFocusTarget: HTMLElement | undefined;
 +	private readonly modifierButtonByKind = new Map<KeybarModifier, Set<HTMLButtonElement>>();
@@ -157,7 +158,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  	) {
  		super();
  	}
-@@ -99,10 +174,16 @@ export class CodeServerClient extends Di
+@@ -99,10 +175,16 @@ export class CodeServerClient extends Di
  		}
  
  		if (this.productService.serviceWorker) {
@@ -176,7 +177,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.createBottomKeybarSkeleton();
  	}
  
-@@ -190,24 +271,210 @@ export class CodeServerClient extends Di
+@@ -190,24 +272,210 @@ export class CodeServerClient extends Di
  		}
  	}
  
@@ -389,7 +390,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  			return;
  		}
  
-@@ -218,27 +485,37 @@ export class CodeServerClient extends Di
+@@ -218,27 +486,37 @@ export class CodeServerClient extends Di
  
  		const storedVisibility = this.storageService.getBoolean(CodeServerClient.KEYBAR_VISIBLE_STORAGE_KEY, StorageScope.APPLICATION);
  		this.keybarVisible = storedVisibility ?? true;
@@ -434,7 +435,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,48 +524,1238 @@ export class CodeServerClient extends Di
+@@ -247,31 +525,1233 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -447,15 +448,15 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		window.visualViewport?.addEventListener('scroll', viewportListener);
 +		document.addEventListener('fullscreenchange', viewportListener);
 +		document.addEventListener('webkitfullscreenchange', viewportListener as EventListener);
-+		this._register(toDisposable(() => {
+ 		this._register(toDisposable(() => {
+-			this.clearKeybarInset();
 +			window.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('resize', viewportListener);
 +			window.visualViewport?.removeEventListener('scroll', viewportListener);
 +			document.removeEventListener('fullscreenchange', viewportListener);
 +			document.removeEventListener('webkitfullscreenchange', viewportListener as EventListener);
 +		}));
- 		this._register(toDisposable(() => {
--			this.clearKeybarInset();
++		this._register(toDisposable(() => {
 +			this.clearKeybarHeight();
 +			this.clearKeyboardOverlapInset();
  			handle.remove();
@@ -474,14 +475,14 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		const fullscreenElement = (document.fullscreenElement
 +			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
 +		return fullscreenElement instanceof HTMLElement ? fullscreenElement : document.documentElement;
-+	}
-+
-+	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
-+		const root = this.getCurrentKeybarRoot();
-+		root.append(keybar, handle);
  	}
  
 -	private createKeybarRow(labels: string[]): HTMLDivElement {
++	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
++		const root = this.getCurrentKeybarRoot();
++		root.append(keybar, handle);
++	}
++
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
@@ -494,7 +495,6 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 -			button.textContent = label;
 -			button.addEventListener('click', () => {
 -				this.logService.debug(`[Dermux Keybar] tapped "${label}"`);
--			});
 +			button.tabIndex = -1;
 +			button.dataset.csKeybarId = buttonConfig.id;
 +			const widthUnits = Math.max(0.25, buttonConfig.widthUnits ?? 1);
@@ -532,15 +532,18 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			if (this.isFnToggleButton(buttonConfig.id) && this.fnModeEnabled) {
 +				button.classList.add('cs-dermux-keybar-btn-active');
 +			}
-+			if (this.isCapsToggleButton(buttonConfig.id) && this.capsLockEnabled) {
-+				button.classList.add('cs-dermux-keybar-btn-active', 'cs-dermux-keybar-btn-locked');
++				if (this.isCapsToggleButton(buttonConfig.id) && this.capsLockEnabled) {
++					button.classList.add('cs-dermux-keybar-btn-active', 'cs-dermux-keybar-btn-locked');
++				}
++				if (this.isSelectionToggleButton(buttonConfig.id) && this.selectionModeEnabled) {
++					button.classList.add('cs-dermux-keybar-btn-active');
++				}
++				row.appendChild(button);
 +			}
- 			row.appendChild(button);
- 		}
- 
- 		return row;
- 	}
- 
++
++		return row;
++	}
++
 +	private enforceOpaqueElementStyles(element: HTMLElement, backgroundColor?: string): void {
 +		element.style.setProperty('opacity', '1', 'important');
 +		element.style.setProperty('filter', 'none', 'important');
@@ -712,6 +715,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return buttonId.toLowerCase() === 'langswitch';
 +	}
 +
++	private isSelectionToggleButton(buttonId: string): boolean {
++		return buttonId.toLowerCase() === 'selectionmode';
++	}
++
 +	private isArrowNavigationButton(buttonId: string): boolean {
 +		const normalizedId = buttonId.toLowerCase();
 +		return normalizedId === 'arrowup' || normalizedId === 'arrowdown' || normalizedId === 'arrowleft' || normalizedId === 'arrowright';
@@ -770,6 +777,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +		if (this.isLanguageToggleButton(buttonConfig.id)) {
 +			this.toggleKeybarLayout();
++			return true;
++		}
++
++		if (this.isSelectionToggleButton(buttonConfig.id)) {
++			this.selectionModeEnabled = !this.selectionModeEnabled;
++			void this.reloadKeybarConfig(false);
 +			return true;
 +		}
 +
@@ -995,7 +1008,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +					normal: { label: '↑', key: 'ArrowUp' },
 +					fn: { label: 'PgUp', key: 'PageUp' },
 +				}),
-+				this.createPlaceholderButton('ReservedRightPlaceholder', '', 1),
++				this.createToggleButton('SelectionMode', this.selectionModeEnabled ? 'SEL●' : 'SEL', 1),
 +			],
 +			[
 +				this.createModifierButton('CtrlLeft', 'Ctrl', 1.25),
@@ -1252,14 +1265,16 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			this.notificationService.notify({
 +				severity: Severity.Info,
 +				message: localize('dermux.keybarReloaded', "Dermux keybar reloaded."),
-+			});
+ 			});
+-			row.appendChild(button);
 +		}
 +	}
 +	private async dispatchKeybarAction(action: IKeybarActionConfig): Promise<boolean> {
 +		if (action.type === 'noop') {
 +			return true;
-+		}
-+
+ 		}
+ 
+-		return row;
 +		if (action.type === 'command') {
 +			if (!action.command) {
 +				return this.finishNonModifierAction(false);
@@ -1659,11 +1674,10 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		}
 +
 +		return undefined;
-+	}
-+
+ 	}
+ 
  	private setKeybarVisibility(): void {
- 		const keybar = this.keybarContainer;
- 		const handle = this.keybarHandle;
+@@ -280,15 +1760,16 @@ export class CodeServerClient extends Di
  		if (!keybar || !handle) {
  			return;
  		}
@@ -1684,7 +1698,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1766,322 @@ export class CodeServerClient extends Di
+@@ -299,7 +1780,601 @@ export class CodeServerClient extends Di
  		);
  	}
  
@@ -1737,6 +1751,19 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			return;
 +		}
 +
++		type SelectionSurface = 'terminal' | 'editor';
++		interface ISelectionSession {
++			surface: SelectionSurface;
++			root: HTMLElement;
++			scrollTarget: HTMLElement;
++			touchId: number;
++			lastClientX: number;
++			lastClientY: number;
++			lastScreenX: number;
++			lastScreenY: number;
++			didMove: boolean;
++		}
++
 +		let activeViewport: HTMLElement | undefined;
 +		let activeTouchId: number | undefined;
 +		let touchStartTarget: EventTarget | null = null;
@@ -1745,8 +1772,15 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		let lastClientX = 0;
 +		let lastClientY = 0;
 +		let axisLock: 'pending' | 'vertical' | 'horizontal' = 'pending';
++		let selectionSession: ISelectionSession | undefined;
++		let selectionAutoScrollHandle: number | undefined;
 +		const TAP_MOVE_THRESHOLD_PX = 10;
 +		const TAP_MAX_DURATION_MS = 500;
++		const SELECTION_MOVE_THRESHOLD_PX = 3;
++		const SELECTION_EDGE_THRESHOLD_PX = 52;
++		const SELECTION_AUTOSCROLL_TICK_MS = 20;
++		const SELECTION_AUTOSCROLL_MIN_STEP_PX = 3;
++		const SELECTION_AUTOSCROLL_MAX_STEP_PX = 26;
 +
 +		const findTerminalViewport = (target: EventTarget | null): HTMLElement | undefined => {
 +			if (!(target instanceof HTMLElement)) {
@@ -1764,8 +1798,188 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			if (!(target instanceof HTMLElement)) {
 +				return undefined;
 +			}
-+			const terminalElement = target.closest('.xterm');
-+			return terminalElement instanceof HTMLElement ? terminalElement : undefined;
++			const terminalContainer = target.closest('.terminal-wrapper, .xterm');
++			if (!(terminalContainer instanceof HTMLElement)) {
++				return undefined;
++			}
++			if (terminalContainer.classList.contains('xterm')) {
++				return terminalContainer;
++			}
++			return terminalContainer.querySelector<HTMLElement>('.xterm') ?? terminalContainer;
++		};
++
++		const findEditorRoot = (target: EventTarget | null): HTMLElement | undefined => {
++			if (!(target instanceof HTMLElement)) {
++				return undefined;
++			}
++			const editorRoot = target.closest('.monaco-editor');
++			return editorRoot instanceof HTMLElement ? editorRoot : undefined;
++		};
++
++		const findEditorScrollTarget = (editorRoot: HTMLElement, target: EventTarget | null): HTMLElement => {
++			if (target instanceof HTMLElement) {
++				const nearbyScrollable = target.closest('.monaco-scrollable-element');
++				if (nearbyScrollable instanceof HTMLElement) {
++					return nearbyScrollable;
++				}
++			}
++			const rootScrollable = editorRoot.querySelector<HTMLElement>('.monaco-scrollable-element');
++			return rootScrollable ?? editorRoot;
++		};
++
++		const findSelectionSurface = (target: EventTarget | null): { surface: SelectionSurface; root: HTMLElement; scrollTarget: HTMLElement } | undefined => {
++			const terminalRoot = findTerminalElement(target);
++			if (terminalRoot) {
++				const viewport = terminalRoot.querySelector<HTMLElement>('.xterm-viewport') ?? terminalRoot;
++				return { surface: 'terminal', root: terminalRoot, scrollTarget: viewport };
++			}
++
++			const editorRoot = findEditorRoot(target);
++			if (editorRoot) {
++				return {
++					surface: 'editor',
++					root: editorRoot,
++					scrollTarget: findEditorScrollTarget(editorRoot, target),
++				};
++			}
++
++			return undefined;
++		};
++
++		const isWithinSelectionRoot = (target: HTMLElement, session: ISelectionSession): boolean => {
++			const surfaceRoot = session.surface === 'terminal'
++				? target.closest('.terminal-wrapper, .xterm')
++				: target.closest('.monaco-editor');
++			if (!(surfaceRoot instanceof HTMLElement)) {
++				return false;
++			}
++			return (
++				surfaceRoot === session.root
++				|| surfaceRoot.contains(session.root)
++				|| session.root.contains(surfaceRoot)
++			);
++		};
++
++		const resolveSelectionDispatchTarget = (session: ISelectionSession, clientX: number, clientY: number): HTMLElement => {
++			const pointTarget = document.elementFromPoint(clientX, clientY);
++			if (pointTarget instanceof HTMLElement && isWithinSelectionRoot(pointTarget, session)) {
++				return pointTarget;
++			}
++
++			if (session.surface === 'terminal') {
++				const terminalFallback = session.root.querySelector<HTMLElement>('.xterm-screen');
++				if (terminalFallback) {
++					return terminalFallback;
++				}
++			} else {
++				const editorFallback = session.root.querySelector<HTMLElement>('.view-lines, .lines-content, textarea.inputarea');
++				if (editorFallback) {
++					return editorFallback;
++				}
++			}
++
++			return session.root;
++		};
++
++		const dispatchSelectionMouseEvent = (
++			session: ISelectionSession,
++			type: 'mousedown' | 'mousemove' | 'mouseup' | 'click',
++			clientX: number,
++			clientY: number,
++			buttons: number,
++		): void => {
++			const target = resolveSelectionDispatchTarget(session, clientX, clientY);
++			target.dispatchEvent(new MouseEvent(type, {
++				bubbles: true,
++				cancelable: true,
++				composed: true,
++				clientX,
++				clientY,
++				screenX: session.lastScreenX,
++				screenY: session.lastScreenY,
++				button: 0,
++				buttons,
++				detail: type === 'mousemove' ? 0 : 1,
++			}));
++		};
++
++		const emitSelectionWheel = (session: ISelectionSession, deltaY: number): void => {
++			const target = resolveSelectionDispatchTarget(session, session.lastClientX, session.lastClientY);
++			target.dispatchEvent(new WheelEvent('wheel', {
++				bubbles: true,
++				cancelable: true,
++				composed: true,
++				clientX: session.lastClientX,
++				clientY: session.lastClientY,
++				screenX: session.lastScreenX,
++				screenY: session.lastScreenY,
++				deltaX: 0,
++				deltaY,
++				deltaMode: WheelEvent.DOM_DELTA_PIXEL,
++			}));
++		};
++
++		const computeSelectionAutoScrollStep = (session: ISelectionSession): number => {
++			const scrollRect = session.scrollTarget.getBoundingClientRect();
++			if (scrollRect.height <= 0) {
++				return 0;
++			}
++
++			const edgeThresholdPx = Math.min(
++				SELECTION_EDGE_THRESHOLD_PX,
++				Math.max(18, Math.round(scrollRect.height * 0.2)),
++			);
++			if (session.lastClientY < scrollRect.top + edgeThresholdPx) {
++				const edgeDistance = scrollRect.top + edgeThresholdPx - session.lastClientY;
++				const intensity = Math.min(1, edgeDistance / edgeThresholdPx);
++				return -Math.max(SELECTION_AUTOSCROLL_MIN_STEP_PX, Math.round(SELECTION_AUTOSCROLL_MAX_STEP_PX * intensity));
++			}
++			if (session.lastClientY > scrollRect.bottom - edgeThresholdPx) {
++				const edgeDistance = session.lastClientY - (scrollRect.bottom - edgeThresholdPx);
++				const intensity = Math.min(1, edgeDistance / edgeThresholdPx);
++				return Math.max(SELECTION_AUTOSCROLL_MIN_STEP_PX, Math.round(SELECTION_AUTOSCROLL_MAX_STEP_PX * intensity));
++			}
++			return 0;
++		};
++
++		const stopSelectionAutoScrollLoop = () => {
++			if (selectionAutoScrollHandle !== undefined) {
++				window.clearInterval(selectionAutoScrollHandle);
++				selectionAutoScrollHandle = undefined;
++			}
++		};
++
++		const tickSelectionAutoScroll = () => {
++			const currentSelection = selectionSession;
++			if (!currentSelection) {
++				stopSelectionAutoScrollLoop();
++				return;
++			}
++			if (!currentSelection.didMove) {
++				return;
++			}
++
++			const stepPx = computeSelectionAutoScrollStep(currentSelection);
++			if (stepPx === 0) {
++				return;
++			}
++
++			if (currentSelection.surface === 'terminal') {
++				currentSelection.scrollTarget.scrollTop += stepPx;
++			} else {
++				emitSelectionWheel(currentSelection, stepPx);
++			}
++
++			const scrollRect = currentSelection.scrollTarget.getBoundingClientRect();
++			const clampedY = Math.min(scrollRect.bottom - 1, Math.max(scrollRect.top + 1, currentSelection.lastClientY));
++			dispatchSelectionMouseEvent(currentSelection, 'mousemove', currentSelection.lastClientX, clampedY, 1);
++		};
++
++		const ensureSelectionAutoScrollLoop = () => {
++			if (selectionAutoScrollHandle !== undefined) {
++				return;
++			}
++			selectionAutoScrollHandle = window.setInterval(tickSelectionAutoScroll, SELECTION_AUTOSCROLL_TICK_MS);
 +		};
 +
 +		const resetTouchTracking = () => {
@@ -1775,6 +1989,26 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			touchStartTimestamp = 0;
 +			shouldEmitTapClick = false;
 +			axisLock = 'pending';
++		};
++
++		const resetSelectionTracking = () => {
++			selectionSession = undefined;
++			stopSelectionAutoScrollLoop();
++		};
++
++		const startSelectionTracking = (touch: Touch, startTarget: { surface: SelectionSurface; root: HTMLElement; scrollTarget: HTMLElement }) => {
++			selectionSession = {
++				surface: startTarget.surface,
++				root: startTarget.root,
++				scrollTarget: startTarget.scrollTarget,
++				touchId: touch.identifier,
++				lastClientX: touch.clientX,
++				lastClientY: touch.clientY,
++				lastScreenX: touch.screenX,
++				lastScreenY: touch.screenY,
++				didMove: false,
++			};
++			dispatchSelectionMouseEvent(selectionSession, 'mousedown', touch.clientX, touch.clientY, 1);
 +		};
 +
 +		const emitSyntheticTerminalClick = (touch: Touch) => {
@@ -1828,13 +2062,25 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +
 +		const onTouchStart = (event: TouchEvent) => {
 +			if (event.touches.length !== 1) {
++				resetTouchTracking();
++				resetSelectionTracking();
 +				return;
 +			}
 +			const touch = event.touches[0];
++			if (this.selectionModeEnabled) {
++				const selectionSurface = findSelectionSurface(event.target);
++				if (selectionSurface) {
++					resetTouchTracking();
++					startSelectionTracking(touch, selectionSurface);
++					event.preventDefault();
++					return;
++				}
++			}
 +			const viewport = findTerminalViewport(event.target);
 +			if (!viewport) {
 +				return;
 +			}
++			resetSelectionTracking();
 +			activeViewport = viewport;
 +			activeTouchId = touch.identifier;
 +			touchStartTarget = event.target;
@@ -1846,6 +2092,28 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		};
 +
 +		const onTouchMove = (event: TouchEvent) => {
++			const currentSelection = selectionSession;
++			if (currentSelection) {
++				const touch = Array.from(event.touches).find(candidate => candidate.identifier === currentSelection.touchId);
++				if (!touch) {
++					return;
++				}
++
++				const deltaX = touch.clientX - currentSelection.lastClientX;
++				const deltaY = touch.clientY - currentSelection.lastClientY;
++				if (Math.abs(deltaX) >= SELECTION_MOVE_THRESHOLD_PX || Math.abs(deltaY) >= SELECTION_MOVE_THRESHOLD_PX) {
++					currentSelection.didMove = true;
++					ensureSelectionAutoScrollLoop();
++				}
++				currentSelection.lastClientX = touch.clientX;
++				currentSelection.lastClientY = touch.clientY;
++				currentSelection.lastScreenX = touch.screenX;
++				currentSelection.lastScreenY = touch.screenY;
++				dispatchSelectionMouseEvent(currentSelection, 'mousemove', touch.clientX, touch.clientY, 1);
++				event.preventDefault();
++				return;
++			}
++
 +			if (!activeViewport || activeTouchId === undefined) {
 +				return;
 +			}
@@ -1882,6 +2150,30 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		};
 +
 +		const onTouchEndOrCancel = (event: TouchEvent) => {
++			const currentSelection = selectionSession;
++			if (currentSelection) {
++				const changedTouch = Array.from(event.changedTouches).find(touch => touch.identifier === currentSelection.touchId);
++				if (changedTouch) {
++					currentSelection.lastClientX = changedTouch.clientX;
++					currentSelection.lastClientY = changedTouch.clientY;
++					currentSelection.lastScreenX = changedTouch.screenX;
++					currentSelection.lastScreenY = changedTouch.screenY;
++					dispatchSelectionMouseEvent(currentSelection, 'mouseup', changedTouch.clientX, changedTouch.clientY, 0);
++					if (!currentSelection.didMove) {
++						dispatchSelectionMouseEvent(currentSelection, 'click', changedTouch.clientX, changedTouch.clientY, 0);
++					}
++					event.preventDefault();
++				}
++
++				const touchStillActive = Array.from(event.touches).some(touch => touch.identifier === currentSelection.touchId);
++				if (!touchStillActive || event.type === 'touchcancel') {
++					resetSelectionTracking();
++				}
++				if (changedTouch) {
++					return;
++				}
++			}
++
 +			if (activeTouchId === undefined) {
 +				return;
 +			}
@@ -1903,11 +2195,12 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			}
 +		};
 +
-+		document.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
++		document.addEventListener('touchstart', onTouchStart, { capture: true, passive: false });
 +		document.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
-+		document.addEventListener('touchend', onTouchEndOrCancel, { capture: true, passive: true });
-+		document.addEventListener('touchcancel', onTouchEndOrCancel, { capture: true, passive: true });
++		document.addEventListener('touchend', onTouchEndOrCancel, { capture: true, passive: false });
++		document.addEventListener('touchcancel', onTouchEndOrCancel, { capture: true, passive: false });
 +		this._register(toDisposable(() => {
++			resetSelectionTracking();
 +			document.removeEventListener('touchstart', onTouchStart, true);
 +			document.removeEventListener('touchmove', onTouchMove, true);
 +			document.removeEventListener('touchend', onTouchEndOrCancel, true);
