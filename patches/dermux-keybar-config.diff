@@ -434,7 +434,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		this.keybarHandle = handle;
  
  		let resizeObserver: ResizeObserver | undefined;
-@@ -247,48 +524,1198 @@ export class CodeServerClient extends Di
+@@ -247,48 +524,1238 @@ export class CodeServerClient extends Di
  			resizeObserver.observe(keybar);
  		}
  		this._register(toDisposable(() => resizeObserver?.disconnect()));
@@ -468,9 +468,8 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		setTimeout(() => this.applyWorkbenchBottomInset(), 0);
 +		this.installWorkbenchInsetBootstrapObserver();
 +		this.installTerminalTouchScrollBridge();
- 	}
- 
--	private createKeybarRow(labels: string[]): HTMLDivElement {
++	}
++
 +	private getCurrentKeybarRoot(): HTMLElement {
 +		const fullscreenElement = (document.fullscreenElement
 +			?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
@@ -480,8 +479,9 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +	private appendKeybarToCurrentRoot(keybar: HTMLElement, handle: HTMLElement): void {
 +		const root = this.getCurrentKeybarRoot();
 +		root.append(keybar, handle);
-+	}
-+
+ 	}
+ 
+-	private createKeybarRow(labels: string[]): HTMLDivElement {
 +	private createKeybarRow(buttons: readonly IKeybarButtonConfig[]): HTMLDivElement {
  		const row = document.createElement('div');
  		row.className = 'cs-dermux-keybar-row';
@@ -1314,13 +1314,23 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +				}
 +			}
 +			const isPrintableCharacter = action.key.length === 1;
-+			if (isPrintableCharacter && !hasHardModifiers) {
-+				if (terminalFocused) {
-+					const didSendToTerminal = await this.sendSequenceToTerminal(action.key);
-+					return this.finishNonModifierAction(didSendToTerminal);
++				if (isPrintableCharacter && !hasHardModifiers) {
++					if (terminalFocused) {
++						const didSendToTerminal = await this.sendSequenceToTerminal(action.key);
++						return this.finishNonModifierAction(didSendToTerminal);
++					}
++					const didType = await this.typeText(action.key);
++					return this.finishNonModifierAction(didType);
 +				}
-+				const didType = await this.typeText(action.key);
-+				return this.finishNonModifierAction(didType);
++				const terminalFallbackCommandId = this.resolveTerminalClipboardFallbackCommand(action, modifiers, terminalFocused);
++				if (terminalFallbackCommandId) {
++					try {
++						await this.commandService.executeCommand(terminalFallbackCommandId);
++						return this.finishNonModifierAction(true);
++				} catch (error) {
++					this.logService.warn(`[Dermux Keybar] fallback command failed "${terminalFallbackCommandId}": ${String(error)}`);
++					return this.finishNonModifierAction(false);
++				}
 +			}
 +			const didDispatch = this.dispatchSyntheticKey(action);
 +			return this.finishNonModifierAction(didDispatch);
@@ -1366,6 +1376,34 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +			this.logService.warn(`[Dermux Keybar] clipboard command failed "${commandId}": ${String(error)}`);
 +			return false;
 +		}
++	}
++
++	private resolveTerminalClipboardFallbackCommand(
++		action: IKeybarActionConfig,
++		modifiers: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean },
++		terminalFocused: boolean,
++	): string | undefined {
++		if (!action.key || action.key.length !== 1) {
++			return undefined;
++		}
++		if (!modifiers.ctrl || modifiers.alt || modifiers.meta || !modifiers.shift) {
++			return undefined;
++		}
++
++		const upperKey = action.key.toUpperCase();
++		if (upperKey === 'C') {
++			if (terminalFocused) {
++				return 'workbench.action.terminal.copySelection';
++			}
++			// In web the default Ctrl+Shift+C action outside terminal is "new terminal".
++			return 'workbench.action.terminal.new';
++		}
++
++		if (upperKey === 'V' && terminalFocused) {
++			return 'workbench.action.terminal.paste';
++		}
++
++		return undefined;
 +	}
 +
 +	private finishNonModifierAction(result: boolean): boolean {
@@ -1537,15 +1575,17 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
 +		return false;
 +	}
 +
-+	private dispatchSyntheticKey(action: IKeybarActionConfig): boolean {
++	private resolveKeybarDispatchTarget(): HTMLElement {
 +		const activeElement = document.activeElement;
 +		let target = activeElement instanceof HTMLElement ? activeElement : undefined;
 +		if (target && this.isKeybarElement(target)) {
 +			target = this.keybarActionFocusTarget;
 +		}
-+		if (!target) {
-+			target = this.keybarActionFocusTarget ?? document.body;
-+		}
++		return target ?? this.keybarActionFocusTarget ?? document.body;
++	}
++
++	private dispatchSyntheticKey(action: IKeybarActionConfig): boolean {
++		const target = this.resolveKeybarDispatchTarget();
 +		if (target instanceof HTMLElement && target !== document.activeElement) {
 +			this.restoreFocusAfterKeybarInteraction(target);
 +		}
@@ -1644,7 +1684,7 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
  		}
  
  		this.storageService.store(
-@@ -299,7 +1726,322 @@ export class CodeServerClient extends Di
+@@ -299,7 +1766,322 @@ export class CodeServerClient extends Di
  		);
  	}
  
